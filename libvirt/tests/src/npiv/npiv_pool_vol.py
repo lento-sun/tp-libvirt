@@ -1,6 +1,5 @@
 import os
 import logging
-import time
 from shutil import copyfile
 
 from avocado.core import exceptions
@@ -104,8 +103,6 @@ def run(test, params, env):
     volume_capacity = params.get("volume_capacity", '1G')
     allocation = params.get("allocation", '1G')
     frmt = params.get("volume_format", 'qcow2')
-
-
     disk_xml = ""
 
     if pool_type == "scsi":
@@ -124,7 +121,6 @@ def run(test, params, env):
     libvirt_vm = lib_vm.VM(vm_name, vm.params, vm.root_dir,
                            vm.address_cache)
     pvt = utlv.PoolVolumeTest(test, params)
-
     pool_ins = libvirt_storage.StoragePool()
     if pool_ins.pool_exists(pool_name):
         raise exceptions.TestFail("Pool %s already exist" % pool_name)
@@ -179,8 +175,6 @@ def run(test, params, env):
                 logging.debug("Create pool from file: %s", f.read())
             finally:
                 f.close()
-
-
 
     try:
         if (pre_def_pool == "yes") and (define_pool == "yes"):
@@ -321,9 +315,8 @@ def run(test, params, env):
             pvt.cleanup_pool(pool_name, pool_type, pool_target,
                              emulated_image, **pool_kwargs)
         if (test_unit and (need_vol_create == "yes")
-            and (pool_type == "logical")):
+                and (pool_type == "logical")):
             process.system('lvremove -f %s/%s' % (pool_name, test_unit),
                            verbose=True)
             process.system('vgremove -f %s' % pool_name, verbose=True)
             process.system('pvremove -f %s' % source_dev, verbose=True)
-
