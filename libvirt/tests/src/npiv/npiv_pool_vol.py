@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from shutil import copyfile
 
 from avocado.core import exceptions
@@ -62,6 +63,21 @@ def find_mpath_devs():
     return mpath_devs
 
 
+def is_mpath_devs_added(old_mpath_devs):
+    """
+    Check if a mpath device is added
+    :param old_mpaths: Pre-existing mpaths
+    :return: True/False based on addition
+    """
+    new_mpath_devs = find_mpath_devs()
+    new_mpath_devs.sort()
+    old_mpath_devs.sort()
+    if len(new_mpath_devs) - len(old_mpath_devs) >= 1:
+        return True
+    else:
+        return False
+
+
 def run(test, params, env):
     """
     Test command: virsh pool-define;pool-start;vol-list pool;
@@ -98,13 +114,16 @@ def run(test, params, env):
     pool_extra_args = ""
     emulated_image = "emulated-image"
 
-    source_dev = params.get("pool_source_dev", "/dev/mapper/mpathc")
+    vhba_wwnn = params.get("vhba_wwnn", "")
+    vhba_wwpn = params.get("vhba_wwpn", "")
     volume_name = params.get("volume_name", "imagefrommapper.qcow2")
     volume_capacity = params.get("volume_capacity", '1G')
     allocation = params.get("allocation", '1G')
     frmt = params.get("volume_format", 'qcow2')
-    disk_xml = ""
 
+    disk_xml = ""
+    new_vhbas = []
+    source_dev = ""
     if pool_type == "scsi":
         if not pool_wwnn and not pool_wwpn:
             raise exceptions.TestSkipError(
@@ -120,7 +139,8 @@ def run(test, params, env):
 
     libvirt_vm = lib_vm.VM(vm_name, vm.params, vm.root_dir,
                            vm.address_cache)
-    pvt = utlv.PoolVolumeTest(test, params)
+    #pvt = utlv.PoolVolumeTest(test, params)
+
     pool_ins = libvirt_storage.StoragePool()
     if pool_ins.pool_exists(pool_name):
         raise exceptions.TestFail("Pool %s already exist" % pool_name)
@@ -142,20 +162,41 @@ def run(test, params, env):
                            'pool_adapter_parent': pool_adapter_parent,
                            'pool_wwnn': pool_wwnn,
                            'pool_wwpn': pool_wwpn}
-        if define_pool_as == "yes":
-            # This part is not implemented yet.
-            pass
     elif pool_type == "logical":
-        if define_pool == "yes":
-            # This part is not implemented yet.
-            pass
+        if (not vhba_wwnn) or (not vhba_wwpn):
+            raise exceptions.TestFail("No wwnn/wwpn provided to create vHBA.")
+        old_mpath_devs = find_mpath_devs()
+        new_vhba = nodedev.nodedev_create_from_xml({
+                "nodedev_parent": online_hbas_list[0],
+                "scsi_wwnn": vhba_wwnn,
+                "scsi_wwpn": vhba_wwpn})
+        utils_misc.wait_for(
+            lambda: nodedev.is_vhbas_added(old_vhbas), timeout=_DELAY_TIME)
+        if not new_vhba:
+            raise exceptions.TestFail("vHBA not sucessfully generated.")
+        new_vhbas.append(new_vhba)
+        utils_misc.wait_for(
+            lambda: is_mpath_devs_added(old_mpath_devs), timeout=_DELAY_TIME)
+        if not is_mpath_devs_added(old_mpath_devs):
+            raise exceptions.TestFail("mpath dev not generated.")
+        cur_mpath_devs = find_mpath_devs()
+        new_mpath_devs = list(set(cur_mpath_devs).difference(
+            set(old_mpath_devs)))
+        logging.debug("The newly added mpath dev is: %s", new_mpath_devs)
+        source_dev = "/dev/mapper/" + new_mpath_devs[0]
+        logging.debug("We are going to use \"%s\" as our source device"
+                      " to create a logical pool", source_dev)
+        # Make sure no partion on the mpath device
+        cmd = "parted %s mklabel msdos yes" % source_dev
+        cmd_result = process.run(cmd, shell=True)
+        cmd_result = process.run(cmd, shell=True)
         if define_pool_as == "yes":
             pool_extra_args = ""
             if source_dev:
                 pool_extra_args = ' --source-dev %s' % source_dev
-
     if pre_def_pool == "yes":
         try:
+            pvt = utlv.PoolVolumeTest(test, params)
             pvt.pre_pool(pool_name, pool_type,
                          pool_target, emulated_image,
                          **pool_kwargs)
@@ -175,7 +216,6 @@ def run(test, params, env):
                 logging.debug("Create pool from file: %s", f.read())
             finally:
                 f.close()
-
     try:
         if (pre_def_pool == "yes") and (define_pool == "yes"):
             cmd_result = virsh.pool_define(pool_xml_f, ignore_status=True,
@@ -192,20 +232,19 @@ def run(test, params, env):
             check_status(cmd_result,
                          "Successfully defined pool: %s"
                          % pool_name)
-        #cmd = "mkfs.ext4 -F %s" % source_dev
-        #cmd_result = process.run(cmd, shell=True)
         if need_pool_build == "yes":
+            time.sleep(5)
+            logging.debug("haha: building pool %s, with SLEEP", pool_name)
             cmd_result = virsh.pool_build(pool_name)
             check_status(cmd_result, "Successfully built pool: %s"
                          % pool_name)
+        # Start the POOL
         cmd_result = virsh.pool_start(pool_name)
         check_status(cmd_result, "Successfully start pool: %s" % pool_name)
         utlv.check_actived_pool(pool_name)
         pool_detail = libvirt_xml.PoolXML.get_pool_details(pool_name)
         logging.debug("Pool detail: %s", pool_detail)
 
-        # Sleep time to list the volume
-#        time.sleep(5)
         if need_vol_create == "yes":
             cmd_result = virsh.vol_create_as(
                     volume_name, pool_name,
@@ -309,14 +348,18 @@ def run(test, params, env):
         if os.path.exists(disk_xml):
             data_dir.clean_tmp_files()
             logging.debug("Cleanup disk xml")
-        if pool_type == "scsi":
+        if pre_def_pool == "yes":
             # Do not apply cleanup_pool for logical pool, logical pool will
             # be cleaned below
             pvt.cleanup_pool(pool_name, pool_type, pool_target,
                              emulated_image, **pool_kwargs)
-        if (test_unit and (need_vol_create == "yes")
+        if (test_unit and (need_vol_create == "yes" and (pre_def_pool == "no"))
                 and (pool_type == "logical")):
             process.system('lvremove -f %s/%s' % (pool_name, test_unit),
                            verbose=True)
             process.system('vgremove -f %s' % pool_name, verbose=True)
             process.system('pvremove -f %s' % source_dev, verbose=True)
+        if new_vhbas:
+            nodedev.vhbas_cleanup(new_vhbas)
+        # Restart multipathd, this is to avoid bz1399075
+        process.system('service multipathd restart', verbose=True)
