@@ -1,6 +1,5 @@
 import os
 import logging
-import time
 from shutil import copyfile
 
 from avocado.core import exceptions
@@ -11,9 +10,9 @@ from virttest import libvirt_storage
 from virttest import libvirt_xml
 from virttest import data_dir
 from virttest import libvirt_vm as lib_vm
+from virttest import utils_misc
 from virttest.libvirt_xml import vm_xml
 from virttest.utils_test import libvirt as utlv
-from virttest import utils_misc
 
 from npiv import npiv_nodedev_create_destroy as nodedev
 
@@ -80,12 +79,9 @@ def is_mpath_devs_added(old_mpath_devs):
 
 def run(test, params, env):
     """
-    Test command: virsh pool-define;pool-start;vol-list pool;
-    attach-device LUN to guest; mount the device, dd; unmount;
-    reboot guest; mount the device, dd again; pool-destroy; pool-undefine;
-
-    Create a libvirt npiv pool from an XML file. The test needs to have a wwpn
-    and wwnn of a vhba in host which is zoned & mapped to a SAN controller.
+    Test command: virsh pool-define; pool-define-as; pool-start;
+    vol-list pool; attach-device LUN to guest; mount the device;
+    dd to the mounted device; unmount; pool-destroy; pool-undefine;
 
     Pre-requiste:
     Host needs to have a wwpn and wwnn of a vHBA which is zoned and mapped to
@@ -108,22 +104,21 @@ def run(test, params, env):
     target_device = params.get("pool_target_dev", "sdc")
     pool_wwnn = params.get("pool_wwnn", "")
     pool_wwpn = params.get("pool_wwpn", "")
-    test_unit = None
-    mount_disk = None
-    pool_kwargs = {}
-    pool_extra_args = ""
-    emulated_image = "emulated-image"
-
     vhba_wwnn = params.get("vhba_wwnn", "")
     vhba_wwpn = params.get("vhba_wwpn", "")
     volume_name = params.get("volume_name", "imagefrommapper.qcow2")
     volume_capacity = params.get("volume_capacity", '1G')
     allocation = params.get("allocation", '1G')
-    frmt = params.get("volume_format", 'qcow2')
-
+    vol_format = params.get("volume_format", 'raw')
+    test_unit = None
+    mount_disk = None
+    pool_kwargs = {}
+    pool_extra_args = ""
+    emulated_image = "emulated-image"
     disk_xml = ""
     new_vhbas = []
     source_dev = ""
+
     if pool_type == "scsi":
         if not pool_wwnn and not pool_wwpn:
             raise exceptions.TestSkipError(
@@ -171,12 +166,12 @@ def run(test, params, env):
                 "scsi_wwnn": vhba_wwnn,
                 "scsi_wwpn": vhba_wwpn})
         utils_misc.wait_for(
-            lambda: nodedev.is_vhbas_added(old_vhbas), timeout=_DELAY_TIME)
+            lambda: nodedev.is_vhbas_added(old_vhbas), timeout=_DELAY_TIME*2)
         if not new_vhba:
             raise exceptions.TestFail("vHBA not sucessfully generated.")
         new_vhbas.append(new_vhba)
         utils_misc.wait_for(
-            lambda: is_mpath_devs_added(old_mpath_devs), timeout=_DELAY_TIME)
+            lambda: is_mpath_devs_added(old_mpath_devs), timeout=_DELAY_TIME*2)
         if not is_mpath_devs_added(old_mpath_devs):
             raise exceptions.TestFail("mpath dev not generated.")
         cur_mpath_devs = find_mpath_devs()
@@ -186,7 +181,7 @@ def run(test, params, env):
         source_dev = "/dev/mapper/" + new_mpath_devs[0]
         logging.debug("We are going to use \"%s\" as our source device"
                       " to create a logical pool", source_dev)
-        # Make sure no partion on the mpath device
+        # Make sure no partion on the mpath device, run twice to avoid failure
         cmd = "parted %s mklabel msdos yes" % source_dev
         cmd_result = process.run(cmd, shell=True)
         cmd_result = process.run(cmd, shell=True)
@@ -202,7 +197,7 @@ def run(test, params, env):
                          **pool_kwargs)
             utils_misc.wait_for(
                     lambda: nodedev.is_vhbas_added(old_vhbas),
-                    _DELAY_TIME)
+                    _DELAY_TIME*2)
             virsh.pool_dumpxml(pool_name, to_file=pool_xml_f)
             virsh.pool_destroy(pool_name)
         except Exception, e:
@@ -233,8 +228,6 @@ def run(test, params, env):
                          "Successfully defined pool: %s"
                          % pool_name)
         if need_pool_build == "yes":
-            time.sleep(5)
-            logging.debug("haha: building pool %s, with SLEEP", pool_name)
             cmd_result = virsh.pool_build(pool_name)
             check_status(cmd_result, "Successfully built pool: %s"
                          % pool_name)
@@ -249,7 +242,7 @@ def run(test, params, env):
             cmd_result = virsh.vol_create_as(
                     volume_name, pool_name,
                     volume_capacity, allocation,
-                    frmt, "", debug=True
+                    vol_format, "", debug=True
                     )
             check_status(
                     cmd_result,
@@ -257,7 +250,8 @@ def run(test, params, env):
                     % pool_name
                     )
 
-        vol_list = utlv.get_vol_list(pool_name)
+        vol_list = utlv.get_vol_list(pool_name, vol_check=True,
+                                     timeout=_DELAY_TIME*3)
         logging.debug('Volume list is: %s' % vol_list)
         test_unit = vol_list.keys()[0]
         logging.info(
@@ -271,7 +265,7 @@ def run(test, params, env):
         bf_disks = libvirt_vm.get_disks()
         disk_params = {'type_name': 'volume', 'target_dev': target_device,
                        'target_bus': 'virtio', 'source_pool': pool_name,
-                       'source_volume': test_unit, 'driver_type': 'raw'}
+                       'source_volume': test_unit, 'driver_type': vol_format}
         disk_xml = os.path.join(data_dir.get_tmp_dir(), 'disk_xml.xml')
         lun_disk_xml = utlv.create_disk_xml(disk_params)
 
@@ -280,9 +274,6 @@ def run(test, params, env):
             vm_name, disk_xml, debug=True)
 
         check_status(attach_success, 'Disk attached successfully')
-
-        virsh.reboot(vm_name, debug=True)
-
         logging.info("Checking disk availability in domain")
         if not vmxml.get_disk_count(vm_name):
             raise exceptions.TestFail("No disk in domain %s." % vm_name)
@@ -291,8 +282,6 @@ def run(test, params, env):
         if new_count <= old_count:
             raise exceptions.TestFail(
                 "Failed to attach disk %s" % lun_disk_xml)
-
-        session = vm.wait_for_login()
         output = session.cmd_status_output('lsblk')
         logging.debug("%s", output[1])
         logging.debug("Disks before attach: %s", bf_disks)
@@ -319,9 +308,9 @@ def run(test, params, env):
         logging.debug("Unmounting disk")
         session.cmd_status_output('umount %s' % mount_disk)
 
-        virsh.reboot(vm_name, debug=True)
+#        virsh.reboot(vm_name, debug=True)
 
-        session = vm.wait_for_login()
+#        session = vm.wait_for_login()
         output = session.cmd_status_output('mount')
         logging.debug("%s", output[1])
         mount_success = mount_and_dd(session, mount_disk)
