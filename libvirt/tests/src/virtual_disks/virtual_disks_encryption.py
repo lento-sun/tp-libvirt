@@ -134,9 +134,12 @@ def run(test, params, env):
             elif target.startswith("hd"):
                 if added_parts[0].startswith("sd"):
                     added_part = added_parts[0]
+            elif target.startswith("sd"):
+                if added_parts[0].startswith("sd"):
+                    added_part = added_parts[0]
 
             if not added_part:
-                logging.error("Cann't see added partition in VM")
+                logging.error("Can't see added partition in VM")
                 return False
 
             libvirt.mk_part("/dev/%s" % added_part, size="10M", session=session)
@@ -179,7 +182,7 @@ def run(test, params, env):
     secret_type = params.get("secret_type", "passphrase")
     secret_password_no_encoded = params.get("secret_password_no_encoded", "redhat")
     virt_disk_qcow2_format = "yes" == params.get("virt_disk_qcow2_format")
-
+    hotplug = "yes" == params.get("virt_disk_device_hotplug")
     vm_name = params.get("main_vm")
     vm = env.get_vm(vm_name)
 
@@ -252,29 +255,46 @@ def run(test, params, env):
                 **{"encryption": v_xml.encryption.format, "secret": {
                     "type": v_xml.encryption.secret["type"],
                     "uuid": v_xml.encryption.secret["uuid"]}})
-        # Sync VM xml.
-        vmxml.add_device(disk_xml)
-        vmxml.sync()
+        logging.debug("disk xml is:\n%s" % disk_xml)
+        if not hotplug:
+            # Sync VM xml.
+            vmxml.add_device(disk_xml)
+            vmxml.sync()
 
         try:
-            # Start the VM and check status.
+            # Start the VM do disk hotplug if needed
+            # and check status.
             vm.start()
             if status_error:
                 raise exceptions.TestFail("VM started unexpectedly.")
-
+            if hotplug:
+                logging.debug("attaching disk")
+                result = virsh.attach_device(vm_name, disk_xml.xml)
+                libvirt.check_exit_status(result)
             if not check_in_vm(vm, device_target, old_parts):
                 raise exceptions.TestFail("Check encryption disk in VM failed")
+            if hotplug:
+                logging.debug("detaching disk")
+                result = virsh.detach_device(vm_name, disk_xml.xml)
+                libvirt.check_exit_status(result)
         except virt_vm.VMStartError, e:
             if status_error:
-                logging.debug("VM failed to start as expected."
-                              "Error: %s", str(e))
-                pass
+                if hotplug:
+                    raise exceptions.TestFail("VM failed to start in "
+                                              "hotplug scenario"
+                                              "Error: %s", str(e))
+                    pass
+                else:
+                    logging.debug("VM failed to start as expected."
+                                  "Error: %s", str(e))
+                    pass
             else:
-                # Libvirt2.5.0 onward,AES-CBC encrypted qcow2 images is longer supported.
-                err_msgs = ("AES-CBC encrypted qcow2 images is"
-                            " no longer supported in system emulators")
-                if str(e).count(err_msgs):
-                    exceptions.TestSkipError(err_msgs)
+                # Libvirt2.5.0 onward,AES-CBC encrypted qcow2 images is
+                # no longer supported.
+                startvm_err_msgs = ("AES-CBC encrypted qcow2 images is"
+                                    " no longer supported in system emulators")
+                if str(e).count(startvm_err_msgs):
+                    exceptions.TestSkipError(startvm_err_msgs)
                 else:
                     raise exceptions.TestFail("VM failed to start."
                                               "Error: %s" % str(e))
