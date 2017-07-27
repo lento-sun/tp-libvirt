@@ -4,8 +4,6 @@ import pwd
 import grp
 import logging
 
-from autotest.client.shared import error
-
 from virttest import utils_selinux
 from virttest import virt_vm
 from virttest import utils_config
@@ -100,6 +98,10 @@ def run(test, params, env):
 
     # Set selinux of host.
     backup_sestatus = utils_selinux.get_status()
+    if backup_sestatus == "disabled":
+        test.cancel("SELinux is in Disabled "
+                    "mode. it must be in Enforcing "
+                    "mode to run this test")
     utils_selinux.set_status(host_sestatus)
 
     qemu_sock_mod = False
@@ -143,12 +145,11 @@ def run(test, params, env):
             if status_error:
                 if invalid_label:
                     # invalid label should fail, more info in bug 1165485
-                    raise error.TestNAError("The label or model not valid, "
-                                            "check more info in bug: https://"
-                                            "bugzilla.redhat.com/show_bug.cgi"
-                                            "?id=1165485")
+                    logging.debug("The guest failed to start as expected,"
+                                  "details see bug: bugzilla.redhat.com/show_bug.cgi"
+                                  "?id=1165485")
                 else:
-                    raise error.TestFail("Test succeeded in negative case.")
+                    test.fail("Test succeeded in negative case.")
 
             # Get vm process label when VM is running.
             vm_pid = vm.get_pid()
@@ -169,14 +170,14 @@ def run(test, params, env):
                               disk_context)
                 if sec_label and relabel == 'yes':
                     if disk_context != sec_label_id:
-                        raise error.TestFail("The disk label is not equal to "
-                                             "'%s'." % sec_label_id)
+                        test.fail("The disk label is not equal to "
+                                  "'%s'." % sec_label_id)
 
         except virt_vm.VMStartError, e:
             # Starting VM failed.
             if not status_error:
-                raise error.TestFail("Test failed in positive case."
-                                     "error: %s" % e)
+                test.fail("Test failed in positive case."
+                          "error: %s" % e)
     finally:
         # clean up
         if vm.is_alive():
