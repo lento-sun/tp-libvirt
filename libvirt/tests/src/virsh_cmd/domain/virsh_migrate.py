@@ -739,6 +739,7 @@ def run(test, params, env):
     if options.count("unsafe") and disk_cache != "none":
         unsafe_test = True
 
+    migrate_setup = None
     nfs_client = None
     seLinuxBool = None
     skip_exception = False
@@ -1294,9 +1295,13 @@ def run(test, params, env):
     mount_dir = params.get("mnt_path_name")
     libvirt.setup_or_cleanup_nfs(False, export_dir=exp_dir,
                                  mount_dir=mount_dir,
-                                 restore_selinux=local_selinux_bak)
+                                 restore_selinux=local_selinux_bak,
+                                 rm_export_dir=False)
     # cleanup pre migration setup for remote machine
-    migrate_setup.migrate_pre_setup(dest_uri, params, cleanup=True)
+    if migrate_setup:
+        logging.debug("Clean up migration setup for remote machine")
+        migrate_setup.migrate_pre_setup(dest_uri, params, cleanup=True)
+
     if skip_exception:
         test.cancel(detail)
     if exception:
