@@ -2,6 +2,7 @@ import re
 import os
 import shutil
 import logging
+import platform
 
 from aexpect import ShellTimeoutError
 from aexpect import ShellProcessTerminatedError
@@ -80,6 +81,7 @@ def run(test, params, env):
     extra = params.get("domstate_extra", "")
     vm_action = params.get("domstate_vm_action", "")
     vm_oncrash_action = params.get("domstate_vm_oncrash")
+    reset_action = "yes" == params.get("reset_action", "no")
 
     domid = vm.get_id()
     domuuid = vm.get_uuid()
@@ -116,8 +118,9 @@ def run(test, params, env):
             if not vmxml.xmltreefile.find('devices').findall('panic'):
                 # Add <panic> device to domain
                 panic_dev = Panic()
-                panic_dev.addr_type = "isa"
-                panic_dev.addr_iobase = "0x505"
+                if "ppc" not in platform.machine():
+                    panic_dev.addr_type = "isa"
+                    panic_dev.addr_iobase = "0x505"
                 vmxml.add_device(panic_dev)
             vmxml.sync()
             # Config auto_dump_path in qemu.conf
@@ -229,6 +232,20 @@ def run(test, params, env):
                     if not check_crash_state(output, vm_oncrash_action,
                                              vm_name, dump_file):
                         test.fail(err_msg)
+                    # VM will be in preserved state, perform virsh reset
+                    # and check VM reboots and domstate reflects running
+                    # state from crashed state as bug is observed here
+                    if vm_oncrash_action == "preserve" and reset_action:
+                        virsh_dargs = {'debug': True, 'ignore_status': True}
+                        ret = virsh.reset(vm_name, **virsh_dargs)
+                        if ret.exit_status != 0:
+                            test.fail("virsh reset failed after guest crash: "
+                                      "%s" % ret.stderr)
+                        vm.wait_for_login()
+                        cmd_output = virsh.domstate(vm_name,
+                                                    '--reason').stdout.strip()
+                        if "running" not in cmd_output:
+                            test.fail("guest state failed to get updated")
                     if vm_oncrash_action in ['coredump-destroy',
                                              'coredump-restart']:
                         if not find_dump_file:

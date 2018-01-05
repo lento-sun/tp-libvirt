@@ -405,6 +405,8 @@ def run(test, params, env):
                     test.fail('qemu-kvm-rhev is in dependency')
                 if 'libX11' in output:
                     test.fail('libX11 is in dependency')
+                if 'kernel-rt' in output:
+                    test.fail('kernel-rt is in dependency')
                 win_img = params.get('win_image')
                 command = 'guestfish -a %s -i'
                 if process.run(command % win_img, ignore_status=True).exit_status == 0:
@@ -621,6 +623,7 @@ def run(test, params, env):
                 cmd_install_vm = fh.read().strip()
             process.run('su - %s -c "%s"' % (v2v_user, cmd_install_vm),
                         timeout=10, shell=True)
+            params['cmd_clean_vm'] = "%s 'virsh undefine %s'" % (su_cmd, vm_name)
 
         if checkpoint == 'vmx':
             mount_point = params.get('mount_point')
@@ -638,7 +641,8 @@ def run(test, params, env):
         cmd = "%s %s %s %s" % (utils_v2v.V2V_EXEC, input_option,
                                output_option, v2v_options)
         if v2v_user:
-            cmd = su_cmd + "'%s'" % cmd
+            cmd_export_env = 'export LIBGUESTFS_BACKEND=direct'
+            cmd = "%s '%s;%s'" % (su_cmd, cmd_export_env, cmd)
 
         if params.get('cmd_free') == 'yes':
             cmd = params.get('check_command')
@@ -695,6 +699,8 @@ def run(test, params, env):
         if vmcheck_flag:
             vmcheck = utils_v2v.VMCheck(test, params, env)
             vmcheck.cleanup()
+        if checkpoint in ['with_ic', 'without_ic']:
+            process.run(params['cmd_clean_vm'])
         if new_v2v_user:
             process.system("userdel -f %s" % v2v_user)
         if backup_xml:

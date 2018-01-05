@@ -7,6 +7,7 @@ import threading
 
 from avocado.utils import process
 from avocado.utils import path
+from avocado.core import exceptions
 
 from virttest import nfs
 from virttest import remote
@@ -478,13 +479,14 @@ def run(test, params, env):
            not virsh.domain_exists(vm.name, uri=dest_uri)):
             test.error("Domain is not found with 'paused' state in 50s")
 
-    def run_migration_cmd(cmd):
+    def run_migration_cmd(cmd, timeout=5):
         """
         Check to see the VM on target machine should ran up once
         migration-postcopy command is executed. To get sufficient time to
         check this command takes effect, the VM need run with stress.
 
         :params cmd: The command to be executed while migration
+        :params timeout: timeout for migrate-postcopy to get triggered
 
         """
         stress_thread = threading.Thread(target=thread_func_stress,
@@ -494,7 +496,14 @@ def run(test, params, env):
         process.system_output("virsh %s %s" % (cmd, vm_name))
         logging.debug("Checking the VM state on target host after "
                       "executing '%s'", cmd)
-        check_vm_state(vm, 'running', dest_uri, False)
+
+        def check_vm_state_dest():
+            return check_vm_state(vm, 'running', dest_uri, ignore_error=True)
+
+        # check_vm_state can fail if it checks immediately after virsh
+        # migrate-postcopy, just give a breathe time.
+        if not utils_misc.wait_for(check_vm_state_dest, timeout=timeout):
+            test.fail("VM failed to be in running state at destination")
 
     # For negative scenarios, there_desturi_nonexist and there_desturi_missing
     # let the test takes desturi from variants in cfg and for other scenarios
@@ -735,8 +744,8 @@ def run(test, params, env):
             if (int(utils_memory.get_num_huge_pages_free()) < no_of_HPs):
                 hugepage_assign(str(no_of_HPs))
             logging.debug("Hugepage support check done on host")
-        except:
-            test.cancel("HP not supported/configured")
+        except Exception, info:
+            test.cancel("HP not supported/configured: %s" % info)
 
     # To check mem hotplug should not exceed maxmem
     if mem_hotplug:
@@ -795,6 +804,7 @@ def run(test, params, env):
     nfs_client = None
     seLinuxBool = None
     skip_exception = False
+    fail_exception = False
     exception = False
     remote_viewer_pid = None
     asynch_migration = False
@@ -925,10 +935,10 @@ def run(test, params, env):
 
         # Perform cpu hotplug or hotunplug before migration
         if cpu_hotplug:
+            guest_ip = vm.get_address()
             if hotplug_after_migrate or hotunplug_after_migrate:
                 config_opt = ["StrictHostKeyChecking=no"]
                 guest_user = params.get("username", "root")
-                guest_ip = vm.get_address()
                 guest_pwd = params.get("password", "password")
                 # Configure ssh key between destination machine and VM
                 # before migration, so that commands can be executed from
@@ -1297,8 +1307,10 @@ def run(test, params, env):
             if not re.search(new_nic_mac, vm_dest_xml):
                 check_dest_xml = False
 
-    except test.cancel, detail:
+    except exceptions.TestCancel, detail:
         skip_exception = True
+    except exceptions.TestFail, detail:
+        fail_exception = True
     except Exception, detail:
         exception = True
         logging.error("%s: %s", detail.__class__, detail)
@@ -1367,6 +1379,8 @@ def run(test, params, env):
 
     if skip_exception:
         test.cancel(detail)
+    if fail_exception:
+        test.fail(detail)
     if exception:
         test.error("Error occurred. \n%s: %s" % (detail.__class__, detail))
 

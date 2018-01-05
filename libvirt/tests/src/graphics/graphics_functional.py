@@ -270,6 +270,17 @@ def qemu_vnc_options(libvirt_vm):
 
     vnc_addr_port = vnc_opt_split[0]
     addr, vnc_dict['port'] = vnc_addr_port.rsplit(':', 1)
+
+    #The format of vnc relevant arguments in qemu command line varies
+    #in different RHEL versions, see below:
+    #In RHEL6.9, like '-vnc unix:/var/lib/libvirt/qemu/*.vnc'
+    #In RHEL7.3, like '-vnc unix:/var/lib/libvirt/qemu/*vnc.sock'
+    #In RHEL7.5, like '-vnc vnc=unix:/var/lib/libvirt/qemu/*vnc.sock'
+
+    #Note, for RHEL7.5, 'vnc=' is added before regular arguments.
+    #For compatibility, one more handling is added for this change.
+    addr = addr.split('=')[1] if '=' in addr else addr
+
     if addr.startswith('[') and addr.endswith(']'):
         addr = addr[1:-1]
     vnc_dict['addr'] = addr
@@ -980,6 +991,14 @@ def run(test, params, env):
     5) Parse and check result with expected.
     6) Clean up environment.
     """
+    # Since 3.1.0, '-1' is not an valid value for the VNC port while
+    # autoport is disabled, it means the VM will be failed to be
+    # started as expected. So, cancel test this case since there is
+    # one similar test scenario in the negative_test, which is
+    # negative_tests.vnc_only.no_autoport.port_-2
+    if libvirt_version.version_compare(3, 1, 0) and (params.get("vnc_port") == '-1'):
+        test.cancel('Cancel this case, since it is equivalence class test '
+                    'with case negative_tests.vnc_only.no_autoport.port_-2')
 
     # Since 2.0.0, there are some changes for listen type and port
     # 1. Two new listen types: 'none' and 'socket'(not covered in this test)

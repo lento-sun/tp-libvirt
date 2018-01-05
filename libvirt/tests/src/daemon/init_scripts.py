@@ -91,33 +91,34 @@ def run(test, params, env):
 
     username = 'virt-test'
     utils.run('useradd %s' % username, ignore_status=True)
+    utils.run('usermod -s /bin/bash %s' % username, ignore_status=True)
     try:
         for command in avail_commands:
             if command == 'systemctl':
                 service_call(command, 'start',
                              user=username,
-                             expected_exit_code=4)
+                             expected_exit_code=1)
             service_call(command, 'start')
             service_call(command, 'status')
 
             if command == 'systemctl':
                 service_call(command, 'reload',
                              user=username,
-                             expected_exit_code=4)
+                             expected_exit_code=1)
             service_call(command, 'reload')
             service_call(command, 'status')
 
             if command == 'systemctl':
                 service_call(command, 'restart',
                              user=username,
-                             expected_exit_code=4)
+                             expected_exit_code=1)
             service_call(command, 'restart')
             service_call(command, 'status')
 
             if command == 'systemctl':
                 service_call(command, 'stop',
                              user=username,
-                             expected_exit_code=4)
+                             expected_exit_code=1)
             service_call(command, 'stop')
             if command == 'initctl':
                 service_call(command, 'status')
