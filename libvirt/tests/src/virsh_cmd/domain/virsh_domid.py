@@ -1,11 +1,10 @@
-from autotest.client.shared import error
-
 from avocado.utils import process
 
 from virttest import libvirt_vm
 from virttest import remote
 from virttest import virsh
 from virttest import utils_libvirtd
+from virttest import ssh_key
 
 
 def run(test, params, env):
@@ -40,17 +39,23 @@ def run(test, params, env):
         remote_ip = params.get("remote_ip", "REMOTE.EXAMPLE.COM")
         local_ip = params.get("local_ip", "LOCAL.EXAMPLE.COM")
         remote_pwd = params.get("remote_pwd", "")
+        local_pwd = params.get("local_pwd", "")
         status = 0
         output = ""
         err = ""
         try:
             if remote_ip.count("EXAMPLE.COM") or local_ip.count("EXAMPLE.COM"):
-                raise error.TestNAError("remote_ip and/or local_ip parameters "
-                                        "not changed from default values.")
+                test.cancel("remote_ip and/or local_ip parameters "
+                            "not changed from default values.")
             uri = libvirt_vm.complete_uri(local_ip)
             session = remote.remote_login("ssh", remote_ip, "22", "root",
                                           remote_pwd, "#")
             session.cmd_output('LANG=C')
+
+            # setup ssh auto login from remote machine to test machine
+            ssh_key.setup_remote_ssh_key(remote_ip, "root", remote_pwd,
+                                         local_ip, "root", local_pwd)
+
             command = "virsh -c %s domid %s" % (uri, vm_name)
             status, output = session.cmd_status_output(command,
                                                        internal_timeout=5)
@@ -91,7 +96,7 @@ def run(test, params, env):
     # check status_error
     if status_error == "yes":
         if status == 0 or err == "":
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
     elif status_error == "no":
         if status != 0 or output == "":
-            raise error.TestFail("Run failed with right command")
+            test.fail("Run failed with right command")

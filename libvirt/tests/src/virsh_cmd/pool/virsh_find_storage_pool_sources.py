@@ -7,6 +7,7 @@ from virttest import xml_utils
 from virttest import utils_test
 from virttest import virsh
 from virttest.staging import lv_utils
+from virttest.compat_52lts import decode_to_text as to_text
 
 from provider import libvirt_version
 
@@ -65,7 +66,7 @@ def run(test, params, env):
                 # Create vg by using iscsi device
                 try:
                     lv_utils.vg_create(vg_name, iscsi_device)
-                except Exception, detail:
+                except Exception as detail:
                     utils_test.libvirt.setup_or_cleanup_iscsi(False)
                     raise exceptions.TestFail("vg_create failed: %s" % detail)
                 cleanup_logical = True
@@ -74,17 +75,15 @@ def run(test, params, env):
     if srcSpec:
         if srcSpec == "INVALID.XML":
             src_xml = "<invalid><host name='#@!'/><?source>"
-        else:
-            src_xml = srcSpec
-    else:
-        src_xml = "<source><host name='%s'/></source>" % source_host
-    srcSpec = xml_utils.TempXMLFile()
-    srcSpec.write(src_xml)
-    srcSpec.flush()
-    logging.debug("srcSpec file content:\n%s", file(srcSpec.name).read())
+        elif srcSpec == "VALID.XML":
+            src_xml = "<source><host name='%s'/></source>" % source_host
+        srcSpec = xml_utils.TempXMLFile().name
+        with open(srcSpec, "w+") as srcSpec_file:
+            srcSpec_file.write(src_xml)
+            logging.debug("srcSpec file content:\n%s", srcSpec_file.read())
 
-    if params.get('setup_libvirt_polkit') == 'yes':
-        cmd = "chmod 666 %s" % srcSpec.name
+    if params.get('setup_libvirt_polkit') == 'yes' and srcSpec:
+        cmd = "chmod 666 %s" % srcSpec
         process.run(cmd)
 
     if ro_flag:
@@ -94,7 +93,7 @@ def run(test, params, env):
     try:
         cmd_result = virsh.find_storage_pool_sources(
             source_type,
-            srcSpec.name,
+            srcSpec,
             ignore_status=True,
             debug=True,
             unprivileged_user=unprivileged_user,
@@ -105,7 +104,7 @@ def run(test, params, env):
         # Clean up
         if cleanup_logical:
             cmd = "pvs |grep %s |awk '{print $1}'" % vg_name
-            pv_name = process.system_output(cmd, shell=True)
+            pv_name = to_text(process.system_output(cmd, shell=True))
             lv_utils.vg_remove(vg_name)
             process.run("pvremove %s" % pv_name)
         if cleanup_iscsi:

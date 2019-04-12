@@ -80,6 +80,9 @@ def run(test, params, env):
     new_vhbas = []
     source_dev = ""
     mpath_vol_path = ""
+    old_mpath_conf = ""
+    mpath_conf_path = "/etc/multipath.conf"
+    original_mpath_conf_exist = os.path.exists(mpath_conf_path)
 
     if pool_type == "scsi":
         if ('EXAMPLE' in pool_wwnn) or ('EXAMPLE' in pool_wwpn):
@@ -91,6 +94,8 @@ def run(test, params, env):
                     "No wwpn and wwnn provided for vhba.")
     online_hbas_list = utils_npiv.find_hbas("hba")
     logging.debug("The online hbas are: %s", online_hbas_list)
+    old_mpath_conf = utils_npiv.prepare_multipath_conf(conf_path=mpath_conf_path,
+                                                       replace_existing=True)
     if not online_hbas_list:
         raise exceptions.TestSkipError(
             "Host doesn't have online hba cards")
@@ -146,7 +151,7 @@ def run(test, params, env):
         try:
             cmd = "parted %s mklabel msdos -s" % source_dev
             cmd_result = process.run(cmd, shell=True)
-        except Exception, e:
+        except Exception as e:
             raise exceptions.TestError("Error occurred when parted mklable")
         if define_pool_as == "yes":
             pool_extra_args = ""
@@ -178,7 +183,7 @@ def run(test, params, env):
         try:
             cmd = "parted %s mklabel msdos -s" % mpath_vol_path
             cmd_result = process.run(cmd, shell=True)
-        except Exception, e:
+        except Exception as e:
             raise exceptions.TestError("Error occurred when parted mklable")
     if pre_def_pool == "yes":
         try:
@@ -191,17 +196,14 @@ def run(test, params, env):
                     _DELAY_TIME*2)
             virsh.pool_dumpxml(pool_name, to_file=pool_xml_f)
             virsh.pool_destroy(pool_name)
-        except Exception, e:
+        except Exception as e:
             pvt.cleanup_pool(pool_name, pool_type, pool_target,
                              emulated_image, **pool_kwargs)
             raise exceptions.TestError(
                 "Error occurred when prepare pool xml:\n %s" % e)
         if os.path.exists(pool_xml_f):
-            try:
-                f = open(pool_xml_f, 'r')
+            with open(pool_xml_f, 'r') as f:
                 logging.debug("Create pool from file: %s", f.read())
-            finally:
-                f.close()
     try:
         # define/create/start the pool
         if (pre_def_pool == "yes") and (define_pool == "yes"):
@@ -263,7 +265,7 @@ def run(test, params, env):
                    awk '{FS=\" \"} {print $1}'" % (pool_name, mpath_vol_path)
             cmd_result = process.run(cmd, shell=True)
             status = cmd_result.exit_status
-            output = cmd_result.stdout.strip()
+            output = cmd_result.stdout_text.strip()
             if cmd_result.exit_status:
                 raise exceptions.TestFail("vol-list pool %s failed", pool_name)
             if not output:
@@ -272,7 +274,7 @@ def run(test, params, env):
             logging.info(
                 "Using %s to attach to a guest", test_unit)
         else:
-            test_unit = vol_list.keys()[0]
+            test_unit = list(vol_list.keys())[0]
             logging.info(
                 "Using the first volume %s to attach to a guest", test_unit)
 
@@ -318,7 +320,7 @@ def run(test, params, env):
             logging.debug(vmxml)
             try:
                 vm.start()
-            except virt_vm.VMStartError, e:
+            except virt_vm.VMStartError as e:
                 logging.debug(e)
                 if pool_type == "mpath":
                     raise exceptions.TestSkipError("'mpath' pools for backing "
@@ -410,3 +412,9 @@ def run(test, params, env):
                                 _DELAY_TIME*5, 0.0, 5.0)
         else:
             utils_npiv.restart_multipathd()
+        if old_mpath_conf:
+            utils_npiv.prepare_multipath_conf(conf_path=mpath_conf_path,
+                                              conf_content=old_mpath_conf,
+                                              replace_existing=True)
+        if not original_mpath_conf_exist and os.path.exists(mpath_conf_path):
+            os.remove(mpath_conf_path)

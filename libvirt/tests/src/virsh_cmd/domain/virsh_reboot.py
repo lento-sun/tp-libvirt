@@ -1,10 +1,9 @@
 import re
 import logging
-
 import aexpect
+import time
 
-from autotest.client.shared import error
-
+from virttest.utils_test import libvirt
 from avocado.utils import process
 
 from virttest import libvirt_vm
@@ -34,22 +33,23 @@ def run(test, params, env):
     libvirtd = params.get("libvirtd", "on")
     vm_ref = params.get("reboot_vm_ref")
     status_error = ("yes" == params.get("status_error"))
-    extra = params.get("reboot_extra")
+    extra = params.get("reboot_extra", "")
     remote_ip = params.get("remote_ip", "REMOTE.EXAMPLE.COM")
     local_ip = params.get("local_ip", "LOCAL.EXAMPLE.COM")
     remote_pwd = params.get("remote_pwd", "password")
     agent = ("yes" == params.get("reboot_agent", "no"))
     mode = params.get("reboot_mode", "")
     pre_domian_status = params.get("reboot_pre_domian_status", "running")
+    reboot_readonly = "yes" == params.get("reboot_readonly", "no")
     xml_backup = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
     try:
         # Add or remove qemu-agent from guest before test
         try:
             vm.prepare_guest_agent(channel=agent, start=agent)
-        except virt_vm.VMError, e:
+        except virt_vm.VMError as e:
             logging.debug(e)
             # qemu-guest-agent is not available on REHL5
-            raise error.TestNAError("qemu-guest-agent package is not available")
+            test.cancel("qemu-guest-agent package is not available")
 
         if pre_domian_status == "shutoff":
             virsh.destroy(vm_name)
@@ -70,8 +70,8 @@ def run(test, params, env):
             vm_ref = params.get(vm_ref)
         elif vm_ref == "remote_name":
             if remote_ip.count("EXAMPLE.COM") or local_ip.count("EXAMPLE.COM"):
-                raise error.TestNAError("remote_ip and/or local_ip parameters"
-                                        " not changed from default values")
+                test.cancel("remote_ip and/or local_ip parameters"
+                            " not changed from default values")
             complete_uri = libvirt_vm.complete_uri(local_ip)
             try:
                 session = remote.remote_login("ssh", remote_ip, "22", "root",
@@ -82,11 +82,17 @@ def run(test, params, env):
                 status, output = session.cmd_status_output(command,
                                                            internal_timeout=5)
                 session.close()
-            except (remote.LoginError, process.CmdError, aexpect.ShellError), e:
+                if not status:
+                    # the operation before the end of reboot
+                    # may result in data corruption
+                    vm.wait_for_login().close()
+            except (remote.LoginError, process.CmdError, aexpect.ShellError) as e:
                 logging.error("Exception: %s", str(e))
                 status = -1
         if vm_ref != "remote_name":
-            vm_ref = "%s %s" % (vm_ref, extra)
+            vm_ref = "%s" % vm_ref
+            if extra:
+                vm_ref += " %s" % extra
             cmdresult = virsh.reboot(vm_ref, mode,
                                      ignore_status=True, debug=True)
             status = cmdresult.exit_status
@@ -95,7 +101,26 @@ def run(test, params, env):
                 if not virsh.has_command_help_match('reboot', '\s+--mode\s+'):
                     # old libvirt doesn't support reboot
                     status = -2
+            time.sleep(5)
+            # avoid the check if it is negative test
+            if not status_error:
+                cmdoutput = virsh.domstate(vm_ref, '--reason',
+                                           ignore_status=True, debug=True)
+                domstate_status = cmdoutput.exit_status
+                output = "running" in cmdoutput.stdout
+                if domstate_status or (not output):
+                    test.fail("Cmd error: %s Error status: %s" %
+                              (cmdoutput.stderr, cmdoutput.stdout))
+            elif pre_domian_status != 'shutoff':
+                vm.wait_for_login().close()
         output = virsh.dom_list(ignore_status=True).stdout.strip()
+
+        # Test the readonly mode
+        if reboot_readonly:
+            result = virsh.reboot(vm_ref, ignore_status=True, debug=True, readonly=True)
+            libvirt.check_exit_status(result, expect_error=True)
+            # This is for status_error check
+            status = result.exit_status
 
         # recover libvirtd service start
         if libvirtd == "off":
@@ -104,12 +129,12 @@ def run(test, params, env):
         # check status_error
         if status_error:
             if not status:
-                raise error.TestFail("Run successfully with wrong command!")
+                test.fail("Run successfully with wrong command!")
         else:
             if status or (not re.search(vm_name, output)):
                 if status == -2:
-                    raise error.TestNAError(
-                        "Reboot command doesn't work on older libvirt versions")
-                raise error.TestFail("Run failed with right command")
+                    test.cancel("Reboot command doesn't work on older libvirt "
+                                "versions")
+                test.fail("Run failed with right command")
     finally:
         xml_backup.sync()

@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import base64
+import locale
 
 import aexpect
 
@@ -16,6 +17,8 @@ from virttest.libvirt_xml import vol_xml
 from virttest.libvirt_xml import pool_xml
 from virttest.libvirt_xml import secret_xml
 from virttest.libvirt_xml.devices.disk import Disk
+
+from provider import libvirt_version
 
 
 def run(test, params, env):
@@ -92,13 +95,14 @@ def run(test, params, env):
         # Get secret uuid.
         try:
             encryption_uuid = re.findall(r".+\S+(\ +\S+)\ +.+\S+",
-                                         ret.stdout)[0].lstrip()
-        except IndexError, e:
+                                         ret.stdout.strip())[0].lstrip()
+        except IndexError as e:
             test.error("Fail to get newly created secret uuid")
         logging.debug("Secret uuid %s", encryption_uuid)
 
         # Set secret value.
-        secret_string = base64.b64encode(secret_password_no_encoded)
+        encoding = locale.getpreferredencoding()
+        secret_string = base64.b64encode(secret_password_no_encoded.encode(encoding)).decode(encoding)
         ret = virsh.secret_set_value(encryption_uuid, secret_string,
                                      **virsh_dargs)
         libvirt.check_exit_status(ret)
@@ -116,8 +120,8 @@ def run(test, params, env):
             rpm_stat = session.cmd_status("rpm -q parted || "
                                           "yum install -y parted", 300)
             if rpm_stat != 0:
-                raise test.fail("Failed to query/install parted, make sure"
-                                " that you have usable repo in guest")
+                test.fail("Failed to query/install parted, make sure"
+                          " that you have usable repo in guest")
 
             new_parts = libvirt.get_parts_list(session)
             added_parts = list(set(new_parts).difference(set(old_parts)))
@@ -153,7 +157,7 @@ def run(test, params, env):
             if s != 0:
                 return False
             return True
-        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), e:
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
             logging.error(str(e))
             return False
 
@@ -162,7 +166,11 @@ def run(test, params, env):
     device_target = params.get("virt_disk_device_target", "vdd")
     device_type = params.get("virt_disk_device_type", "file")
     device_bus = params.get("virt_disk_device_bus", "virtio")
-
+    encryption_in_source = "yes" == params.get("encryption_in_source")
+    encryption_out_source = "yes" == params.get("encryption_out_source")
+    if encryption_in_source and not libvirt_version.version_compare(3, 9, 0):
+        test.cancel("Cannot put <encryption> inside disk <source> in "
+                    "this libvirt version.")
     # Pool/Volume options.
     pool_name = params.get("pool_name")
     pool_type = params.get("pool_type")
@@ -217,7 +225,7 @@ def run(test, params, env):
             # If Libvirt version is lower than 2.5.0
             # Creating luks encryption volume is not supported,so skip it.
             create_vol(pool_name, vol_encryption_params, vol_params)
-        except AssertionError, info:
+        except AssertionError as info:
             err_msgs = ("create: invalid option")
             if str(info).count(err_msgs):
                 test.error("Creating luks encryption volume "
@@ -236,24 +244,28 @@ def run(test, params, env):
             dev_attrs = "dir"
         else:
             dev_attrs = "dev"
-        disk_xml.source = disk_xml.new_disk_source(
-            **{"attrs": {dev_attrs: volume_target_path}})
+        disk_source = disk_xml.new_disk_source(
+                **{"attrs": {dev_attrs: volume_target_path}})
         disk_xml.driver = {"name": "qemu", "type": volume_target_format,
                            "cache": "none"}
         disk_xml.target = {"dev": device_target, "bus": device_bus}
-
         v_xml = vol_xml.VolXML.new_from_vol_dumpxml(volume_name, pool_name)
-
         sec_uuids.append(v_xml.encryption.secret["uuid"])
         if not status_error:
             logging.debug("vol info -- format: %s, type: %s, uuid: %s",
                           v_xml.encryption.format,
                           v_xml.encryption.secret["type"],
                           v_xml.encryption.secret["uuid"])
-            disk_xml.encryption = disk_xml.new_encryption(
-                **{"encryption": v_xml.encryption.format, "secret": {
-                    "type": v_xml.encryption.secret["type"],
-                    "uuid": v_xml.encryption.secret["uuid"]}})
+            encryption_dict = {"encryption": v_xml.encryption.format,
+                               "secret": {"type": v_xml.encryption.secret["type"],
+                                          "uuid": v_xml.encryption.secret["uuid"]}}
+            if encryption_in_source:
+                disk_source.encryption = disk_xml.new_encryption(
+                        **encryption_dict)
+            if encryption_out_source:
+                disk_xml.encryption = disk_xml.new_encryption(
+                        **encryption_dict)
+        disk_xml.source = disk_source
         logging.debug("disk xml is:\n%s" % disk_xml)
         if not hotplug:
             # Sync VM xml.
@@ -288,7 +300,7 @@ def run(test, params, env):
                 else:
                     if not check_in_vm(vm, device_target, old_parts):
                         test.fail("Check encryption disk in VM failed")
-        except virt_vm.VMStartError, e:
+        except virt_vm.VMStartError as e:
             if status_error:
                 if hotplug:
                     test.fail("In hotplug scenario, VM should "
@@ -318,6 +330,6 @@ def run(test, params, env):
         for sec_uuid in set(sec_uuids):
             virsh.secret_undefine(sec_uuid, **virsh_dargs)
             virsh.vol_delete(volume_name, pool_name, **virsh_dargs)
-        if virsh.pool_state_dict().has_key(pool_name):
+        if pool_name in virsh.pool_state_dict():
             virsh.pool_destroy(pool_name, **virsh_dargs)
             virsh.pool_undefine(pool_name, **virsh_dargs)

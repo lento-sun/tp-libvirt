@@ -1,8 +1,8 @@
 import os
-
-from autotest.client.shared import error
+import re
 
 from virttest import virsh
+from virttest import data_dir
 from virttest import utils_libvirtd
 
 from provider import libvirt_version
@@ -23,7 +23,7 @@ def run(test, params, env):
     """
     savefile = params.get("save_file", "save.file")
     if savefile:
-        savefile = os.path.join(test.tmpdir, savefile)
+        savefile = os.path.join(data_dir.get_tmp_dir(), savefile)
     libvirtd = params.get("libvirtd", "on")
     extra_param = params.get("save_extra_param")
     vm_ref = params.get("save_vm_ref")
@@ -33,6 +33,8 @@ def run(test, params, env):
     vm_name = params.get("main_vm", "avocado-vt-vm1")
     vm = env.get_vm(vm_name)
     uri = params.get("virsh_uri")
+    readonly = ("yes" == params.get("save_readonly", "no"))
+    expect_msg = params.get("save_err_msg", "")
     unprivileged_user = params.get('unprivileged_user')
     if unprivileged_user:
         if unprivileged_user.count('EXAMPLE'):
@@ -40,8 +42,8 @@ def run(test, params, env):
 
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     domid = vm.get_id()
     domuuid = vm.get_uuid()
@@ -66,7 +68,7 @@ def run(test, params, env):
         options += " --verbose"
     result = virsh.save(vm_ref, savefile, options, ignore_status=True,
                         unprivileged_user=unprivileged_user,
-                        uri=uri, debug=True)
+                        uri=uri, debug=True, readonly=readonly)
     status = result.exit_status
     err_msg = result.stderr.strip()
 
@@ -75,35 +77,38 @@ def run(test, params, env):
         utils_libvirtd.libvirtd_start()
 
     if savefile:
-        virsh.restore(savefile)
+        virsh.restore(savefile, debug=True)
 
     # check status_error
     try:
         if status_error:
             if not status:
-                raise error.TestFail("virsh run succeeded with an "
-                                     "incorrect command")
+                test.fail("virsh run succeeded with an "
+                          "incorrect command")
+            if readonly:
+                if not re.search(expect_msg, err_msg):
+                    test.fail("Fail to get expect err msg: %s" % expect_msg)
         else:
             if status:
-                raise error.TestFail("virsh run failed with a "
-                                     "correct command")
+                test.fail("virsh run failed with a "
+                          "correct command")
             if progress and not err_msg.count("Save:"):
-                raise error.TestFail("No progress information outputed!")
+                test.fail("No progress information outputed!")
             if options.count("running"):
                 if vm.is_dead() or vm.is_paused():
-                    raise error.TestFail("Guest state should be"
-                                         " running after restore"
-                                         " due to the option --running")
+                    test.fail("Guest state should be"
+                              " running after restore"
+                              " due to the option --running")
             elif options.count("paused"):
                 if not vm.is_paused():
-                    raise error.TestFail("Guest state should be"
-                                         " paused after restore"
-                                         " due to the option --paused")
+                    test.fail("Guest state should be"
+                              " paused after restore"
+                              " due to the option --paused")
             else:
                 if vm.is_dead():
-                    raise error.TestFail("Guest state should be"
-                                         " alive after restore"
-                                         " since no option was specified")
+                    test.fail("Guest state should be"
+                              " alive after restore"
+                              " since no option was specified")
     finally:
         if vm.is_paused():
             virsh.resume(vm_name)

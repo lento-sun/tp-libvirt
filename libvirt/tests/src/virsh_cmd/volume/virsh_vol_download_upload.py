@@ -2,11 +2,13 @@ import os
 import logging
 import string
 import hashlib
+import locale
 
-from autotest.client.shared import utils
-from autotest.client.shared import error
+from avocado.utils import process
 
 from virttest import virsh
+from virttest import data_dir
+from virttest import libvirt_xml
 from virttest.utils_test import libvirt as utlv
 
 from provider import libvirt_version
@@ -22,22 +24,21 @@ def digest(path, offset, length):
     :param length: length will read
     :return: md5 result in hex
     """
-    read_fd = open(path, 'rb')
-    read_fd.seek(offset)
-    hash_md = hashlib.md5()
-    done = 0
-    while True:
-        want = 1024
-        if length and length - done < want:
-            want = length - done
-        outstr = read_fd.read(want)
-        got = len(outstr)
-        if got == 0:
-            break
-        done += got
-        hash_md.update(outstr)
+    with open(path, 'rb') as read_fd:
+        read_fd.seek(offset)
+        hash_md = hashlib.md5()
+        done = 0
+        while True:
+            want = 1024
+            if length and length - done < want:
+                want = length - done
+            outstr = read_fd.read(want)
+            got = len(outstr)
+            if got == 0:
+                break
+            done += got
+            hash_md.update(outstr)
 
-    read_fd.close()
     return hash_md.hexdigest()
 
 
@@ -46,12 +47,32 @@ def write_file(path):
     write 1M test data to file
     """
     logging.info("write data into file %s", path)
-    write_fd = open(path, 'wb')
-    datastr = ''.join(string.lowercase + string.uppercase +
-                      string.digits + '.' + '\n')
-    data = ''.join(16384 * datastr)
-    write_fd.write(data)
-    write_fd.close()
+    with open(path, 'wb') as write_fd:
+        datastr = ''.join(string.ascii_lowercase + string.ascii_uppercase +
+                          string.digits + '.' + '\n')
+        data = ''.join(16384 * datastr)
+        write_fd.write(data.encode(locale.getpreferredencoding()))
+
+
+def create_luks_vol(pool_name, vol_name, sec_uuid, vol_arg):
+    """
+    Create a luks volume
+    :param pool_name: the pool in which a vol will be created
+    :param vol_name: the name of the volume
+    :param sec_uuid: secret's uuid to be used for luks encryption
+    :param vol_arg: detailed params to create volume
+    """
+    volxml = libvirt_xml.VolXML()
+    newvol = volxml.new_vol(**vol_arg)
+    luks_encryption_params = {}
+    luks_encryption_params.update({"format": "luks"})
+    luks_encryption_params.update({"secret": {"type": "passphrase",
+                                              "uuid": sec_uuid}})
+    newvol.encryption = volxml.new_encryption(**luks_encryption_params)
+    vol_xml = newvol['xml']
+    logging.debug("Create volume from XML: %s" % newvol.xmltreefile)
+    cmd_result = virsh.vol_create(pool_name, vol_xml, ignore_status=True,
+                                  debug=True)
 
 
 def run(test, params, env):
@@ -70,10 +91,10 @@ def run(test, params, env):
     pool_name = params.get("vol_download_upload_pool_name")
     pool_target = params.get("vol_download_upload_pool_target")
     if os.path.dirname(pool_target) is "":
-        pool_target = os.path.join(test.tmpdir, pool_target)
+        pool_target = os.path.join(data_dir.get_tmp_dir(), pool_target)
     vol_name = params.get("vol_download_upload_vol_name")
     file_name = params.get("vol_download_upload_file_name")
-    file_path = os.path.join(test.tmpdir, file_name)
+    file_path = os.path.join(data_dir.get_tmp_dir(), file_name)
     offset = params.get("vol_download_upload_offset")
     length = params.get("vol_download_upload_length")
     capacity = params.get("vol_download_upload_capacity")
@@ -82,6 +103,9 @@ def run(test, params, env):
     operation = params.get("vol_download_upload_operation")
     create_vol = ("yes" == params.get("vol_download_upload_create_vol", "yes"))
     setup_libvirt_polkit = "yes" == params.get("setup_libvirt_polkit")
+    b_luks_encrypt = "luks" == params.get("encryption_method")
+    encryption_password = params.get("encryption_password", "redhat")
+    secret_uuids = []
 
     # libvirt acl polkit related params
     uri = params.get("virsh_uri")
@@ -92,9 +116,8 @@ def run(test, params, env):
 
     if not libvirt_version.version_compare(1, 1, 1):
         if setup_libvirt_polkit:
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
-
+            test.error("API acl test not supported in current"
+                       " libvirt version.")
     try:
         pvt = utlv.PoolVolumeTest(test, params)
         pvt.pre_pool(pool_name, pool_type, pool_target, "volumetest",
@@ -104,14 +127,31 @@ def run(test, params, env):
         if pool_type == "disk":
             vol_name = utlv.new_disk_vol_name(pool_name)
             if vol_name is None:
-                raise error.TestError("Fail to generate volume name")
+                test.error("Fail to generate volume name")
             # update polkit rule as the volume name changed
             if setup_libvirt_polkit:
                 vol_pat = r"lookup\('vol_name'\) == ('\S+')"
                 new_value = "lookup('vol_name') == '%s'" % vol_name
                 utlv.update_polkit_rule(params, vol_pat, new_value)
         if create_vol:
-            pvt.pre_vol(vol_name, frmt, capacity, allocation, pool_name)
+            if b_luks_encrypt:
+                if not libvirt_version.version_compare(2, 0, 0):
+                    test.cancel("LUKS format not supported in "
+                                "current libvirt version")
+                params['sec_volume'] = os.path.join(pool_target, vol_name)
+                luks_sec_uuid = utlv.create_secret(params)
+                ret = virsh.secret_set_value(luks_sec_uuid,
+                                             encryption_password,
+                                             encode=True)
+                utlv.check_exit_status(ret)
+                secret_uuids.append(luks_sec_uuid)
+                vol_arg = {}
+                vol_arg['name'] = vol_name
+                vol_arg['capacity'] = int(capacity)
+                vol_arg['allocation'] = int(allocation)
+                create_luks_vol(pool_name, vol_name, luks_sec_uuid, vol_arg)
+            else:
+                pvt.pre_vol(vol_name, frmt, capacity, allocation, pool_name)
 
         vol_list = virsh.vol_list(pool_name).stdout.strip()
         # iscsi volume name is different from others
@@ -173,7 +213,8 @@ def run(test, params, env):
                           ori_digest)
 
             if setup_libvirt_polkit:
-                utils.run("chmod 666 %s" % file_path)
+                process.run("chmod 666 %s" % file_path, ignore_status=True,
+                            shell=True)
 
             # Do volume upload
             result = virsh.vol_upload(vol_name, file_path, options,
@@ -191,8 +232,8 @@ def run(test, params, env):
                    ori_post_digest == aft_post_digest:
                     logging.info("file pre and aft digest match")
                 else:
-                    raise error.TestFail("file pre or post digests do not"
-                                         "match, in %s", operation)
+                    test.fail("file pre or post digests do not"
+                              "match, in %s", operation)
 
         if operation == "download":
             # Write date to volume
@@ -203,9 +244,10 @@ def run(test, params, env):
             logging.debug("original digest read from %s is %s", vol_path,
                           ori_digest)
 
-            utils.run("touch %s" % file_path)
+            process.run("touch %s" % file_path, ignore_status=True, shell=True)
             if setup_libvirt_polkit:
-                utils.run("chmod 666 %s" % file_path)
+                process.run("chmod 666 %s" % file_path, ignore_status=True,
+                            shell=True)
 
             # Do volume download
             result = virsh.vol_download(vol_name, file_path, options,
@@ -218,17 +260,19 @@ def run(test, params, env):
                               aft_digest)
 
         if result.exit_status != 0:
-            raise error.TestFail("Fail to %s volume: %s" %
-                                 (operation, result.stderr))
+            test.fail("Fail to %s volume: %s" %
+                      (operation, result.stderr))
 
         # Compare the change part on volume and file
         if ori_digest == aft_digest:
             logging.info("file digests match, volume %s suceed", operation)
         else:
-            raise error.TestFail("file digests do not match, volume %s failed"
-                                 % operation)
+            test.fail("file digests do not match, volume %s failed"
+                      % operation)
 
     finally:
         pvt.cleanup_pool(pool_name, pool_type, pool_target, "volumetest")
+        for secret_uuid in set(secret_uuids):
+            virsh.secret_undefine(secret_uuid)
         if os.path.isfile(file_path):
             os.remove(file_path)

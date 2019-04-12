@@ -24,7 +24,7 @@ def run(test, params, env):
     """
     Convert specific xen guest
     """
-    for v in params.itervalues():
+    for v in list(params.values()):
         if "V2V_EXAMPLE" in v:
             test.cancel("Please set real value for %s" % v)
     if utils_v2v.V2V_EXEC is None:
@@ -43,7 +43,7 @@ def run(test, params, env):
     pvt = libvirt.PoolVolumeTest(test, params)
     address_cache = env.get('address_cache')
     checkpoint = params.get('checkpoint', '')
-    bk_list = ['vnc_autoport', 'vnc_encrypt']
+    bk_list = ['vnc_autoport', 'vnc_encrypt', 'vnc_encrypt_warning']
     error_list = []
 
     def log_fail(msg):
@@ -160,7 +160,7 @@ def run(test, params, env):
             elif output_mode == 'libvirt':
                 try:
                     virsh.start(vm_name, debug=True, ignore_status=False)
-                except Exception, e:
+                except Exception as e:
                     test.fail('Start vm failed: %s', str(e))
             # Check guest following the checkpoint document after convertion
             logging.info('Checking common checkpoints for v2v')
@@ -290,7 +290,7 @@ def run(test, params, env):
                 params[checkpoint] = {'autoport': 'yes'}
                 vm_xml.VMXML.set_graphics_attr(vm_name, params[checkpoint],
                                                virsh_instance=virsh_instance)
-            elif checkpoint == 'vnc_encrypt':
+            elif checkpoint in ['vnc_encrypt', 'vnc_encrypt_warning']:
                 params[checkpoint] = {'passwd': params.get('vnc_passwd', 'redhat')}
                 vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(
                         vm_name, virsh_instance=virsh_instance)
@@ -320,7 +320,7 @@ def run(test, params, env):
                 cmd = "sed -i 's|%s|%s|' %s" % (params['remote_disk_image'],
                                                 params['img_path'], xml_file)
                 process.run(cmd)
-                logging.debug(process.run('cat %s' % xml_file).stdout)
+                logging.debug(process.run('cat %s' % xml_file).stdout_text)
             if checkpoint == 'format_convert':
                 v2v_params['output_format'] = 'qcow2'
         if checkpoint == 'ssh_banner':
@@ -364,7 +364,7 @@ def run(test, params, env):
             logging.debug(xml.xmltreefile)
             disks = xml.get_disk_all()
             logging.debug('Disks: %r', disks)
-            for disk in disks.values():
+            for disk in list(disks.values()):
                 # Check if vm has cdrom attached
                 if disk.get('device') == 'cdrom' and disk.find('source') is None:
                     test.error('No CDROM image attached')

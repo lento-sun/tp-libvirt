@@ -1,12 +1,12 @@
-from autotest.client.shared import error
-from autotest.client.shared import ssh_key
-
+#import logging
+from virttest.utils_test import libvirt
 from avocado.utils import process
 
 from virttest import libvirt_vm
 from virttest import remote
 from virttest import virsh
 from virttest import utils_libvirtd
+from virttest import ssh_key
 
 from provider import libvirt_version
 
@@ -34,9 +34,11 @@ def run(test, params, env):
     remote_pwd = params.get("remote_pwd", None)
     local_ip = params.get("local_ip", "LOCAL.EXAMPLE.COM")
     local_pwd = params.get("local_pwd", "LOCAL.EXAMPLE.COM")
+    paused_after_start_vm = "yes" == params.get("paused_after_start_vm", "no")
+    destroy_readonly = "yes" == params.get("destroy_readonly", "no")
     if vm_ref == "remote" and (remote_ip.count("EXAMPLE.COM") or
                                local_ip.count("EXAMPLE.COM")):
-        raise error.TestNAError(
+        test.cancel(
             "Remote test parameters unchanged from default")
 
     uri = params.get("virsh_uri")
@@ -47,8 +49,8 @@ def run(test, params, env):
 
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     if vm_ref == "id":
         vm_ref = domid
@@ -65,6 +67,10 @@ def run(test, params, env):
         utils_libvirtd.libvirtd_stop()
 
     if vm_ref != "remote":
+        if paused_after_start_vm:
+            virsh.suspend(vm_ref)
+            if not vm.is_paused():
+                test.fail("VM suspend failed")
         status = virsh.destroy(vm_ref, ignore_status=True,
                                unprivileged_user=unprivileged_user,
                                uri=uri, debug=True).exit_status
@@ -91,12 +97,19 @@ def run(test, params, env):
     if libvirtd == "off":
         utils_libvirtd.libvirtd_start()
 
+    # Test the read_only mode
+    if destroy_readonly:
+        result = virsh.destroy(vm_ref, ignore_status=True, debug=True, readonly=True)
+        libvirt.check_exit_status(result, expect_error=True)
+        # This is for status_error check
+        status = result.exit_status
+
     # check status_error
     if status_error == "yes":
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command! "
-                                 "Output:\n%s" % output)
+            test.fail("Run successfully with wrong command! "
+                      "Output:\n%s" % output)
     elif status_error == "no":
         if status != 0:
-            raise error.TestFail("Run failed with right command! Output:\n%s"
-                                 % output)
+            test.fail("Run failed with right command! Output:\n%s"
+                      % output)

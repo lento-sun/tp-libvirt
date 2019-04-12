@@ -1,11 +1,10 @@
 import logging
 
-from autotest.client.shared import error
-
 from virttest import virsh
 from virttest import utils_libvirtd
 from virttest.libvirt_xml import network_xml
 from virttest.libvirt_xml import xcepts
+from virttest.utils_test import libvirt
 
 
 def run(test, params, env):
@@ -18,6 +17,8 @@ def run(test, params, env):
     disable = "yes" == params.get("net_autostart_disable", "no")
     extra = params.get("net_autostart_extra", "")  # extra cmd-line params.
     net_name = params.get("net_autostart_net_name", "autotest")
+    net_transient = "yes" == params.get("net_transient", "no")
+    readonly = ("yes" == params.get("readonly", "no"))
 
     # Prepare environment and record current net_state_dict
     backup = network_xml.NetworkXML.new_all_networks_dict()
@@ -31,8 +32,7 @@ def run(test, params, env):
     except (KeyError, AttributeError):
         pass  # Not found - good
     else:
-        raise error.TestNAError("Found network bridge '%s' - skipping" %
-                                (net_name))
+        test.cancel("Found network bridge '%s' - skipping" % net_name)
 
     # Define a very bare bones bridge, don't provide UUID - use whatever
     # libvirt ends up generating.  We need to define a persistent network
@@ -53,9 +53,9 @@ def run(test, params, env):
         test_xml = network_xml.NetworkXML(network_name=net_name)
         test_xml.xml = temp_bridge
         test_xml.define()
-    except xcepts.LibvirtXMLError, detail:
-        raise error.TestNAError("Failed to define a test network.\n"
-                                "Detail: %s." % detail)
+    except xcepts.LibvirtXMLError as detail:
+        test.error("Failed to define a test network.\n"
+                   "Detail: %s." % detail)
 
     # To guarantee cleanup will be executed
     try:
@@ -68,8 +68,7 @@ def run(test, params, env):
         try:
             testbr_xml = currents[net_name]
         except (KeyError, AttributeError):
-            raise error.TestError("Did not find newly defined bridge '%s'" %
-                                  (net_name))
+            test.error("Did not find newly defined bridge '%s'" % net_name)
 
         # Prepare default property for network
         # Transient network can not be set autostart
@@ -93,11 +92,22 @@ def run(test, params, env):
         if disable:
             net_ref += " --disable"
 
+        if net_transient:
+            # make the network to transient and active
+            ret = virsh.net_start(net_name)
+            libvirt.check_exit_status(ret)
+            ret = virsh.net_undefine(net_name)
+            libvirt.check_exit_status(ret)
+            logging.debug("after make it transistent: %s" % virsh.net_state_dict())
+
         # Run test case
         # Use function in virsh module directly for both normal and error test
-        result = virsh.net_autostart(net_ref, extra)
-        logging.debug(result)
+        result = virsh.net_autostart(net_ref, extra, readonly=readonly)
         status = result.exit_status
+        if status:
+            logging.debug("autostart cmd return:\n%s" % result.stderr.strip())
+        else:
+            logging.debug("set autostart succeed: %s" % virsh.net_state_dict())
 
         # Check if autostart or disable is successful with libvirtd restart.
         # TODO: Since autostart is designed for host reboot,
@@ -110,18 +120,36 @@ def run(test, params, env):
         logging.debug("Current network(s): %s", current_state)
         testbr_xml = currents[net_name]
         is_active = testbr_xml['active']
+        # undefine the persistent&autostart network,
+        # if "autostart" should change to 'no"
+        if not disable and not net_transient:
+            logging.debug("undefine the persistent/autostart network:")
+            ret = virsh.net_undefine(net_name)
+            libvirt.check_exit_status(ret)
+            # after undefine, the network can not be "autostart"
+            if net_name in virsh.net_list("").stdout.strip():
+                current_state = virsh.net_state_dict()[net_name]
+                logging.debug("Current network(s): %s", current_state)
+                net_autostart_now = current_state['autostart']
 
     finally:
-        test_xml.undefine()
+        persistent_net = virsh.net_list("--persistent --all").stdout.strip()
+        if net_name in persistent_net:
+            virsh.net_undefine(net_name)
+        active_net = virsh.net_list("").stdout.strip()
+        if net_name in active_net:
+            virsh.net_destroy(net_name)
 
     # Check Result
     if status_error:
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
     else:
         if disable:
             if status or is_active:
-                raise error.TestFail("Disable autostart failed.")
+                test.fail("Disable autostart failed.")
         else:
             if status or (not is_active):
-                raise error.TestFail("Set network autostart failed.")
+                test.fail("Set network autostart failed.")
+            if net_autostart_now:
+                test.fail("transient network can not be autostart")

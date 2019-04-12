@@ -2,9 +2,8 @@ import os
 import shutil
 import logging
 
-from autotest.client.shared import error
-
 from virttest import virsh
+from virttest import data_dir
 from virttest import utils_misc
 from virttest.libvirt_xml import VMXML
 from virttest.utils_test import libvirt
@@ -12,7 +11,7 @@ from virttest.utils_test import libvirt
 from provider import libvirt_version
 
 
-def create_disk(vm_name, orig_iso, disk_type, target_dev, mode=""):
+def create_disk(test, vm_name, orig_iso, disk_type, target_dev, mode=""):
     """
     :param vm_name : vm_name
     :param source_iso : disk's source backing file
@@ -21,24 +20,23 @@ def create_disk(vm_name, orig_iso, disk_type, target_dev, mode=""):
     :param mode: readonly or shareable
     """
     try:
-        _file = open(orig_iso, 'wb')
-        _file.seek((1024 * 1024) - 1)
-        _file.write(str(0))
-        _file.close()
+        with open(orig_iso, 'wb') as _file:
+            _file.seek((1024 * 1024) - 1)
+            _file.write(str(0).encode())
     except IOError:
-        raise error.TestFail("Create orig_iso failed!")
+        test.fail("Create orig_iso failed!")
     options = "--type %s --sourcetype=file --config" % disk_type
     if mode:
         options += " --mode %s" % mode
     try:
         virsh.attach_disk(vm_name, orig_iso, target_dev, options)
-    except:
+    except Exception:
         os.remove(orig_iso)
-        raise error.TestFail("Failed to attach")
+        test.fail("Failed to attach")
 
 
-def create_attach_xml(update_xmlfile, source_iso, disk_type, target_bus,
-                      target_dev, disk_mode=""):
+def create_attach_xml(test, update_xmlfile, source_iso, disk_type, target_bus,
+                      target_dev, disk_mode="", disk_alias=None):
     """
     Create a xml file to update a device.
 
@@ -48,14 +46,14 @@ def create_attach_xml(update_xmlfile, source_iso, disk_type, target_bus,
     :param target_bus: disk's target bus
     :param target_dev: disk's target device name
     :param disk_mode: readonly or shareable
+    :param disk_alias: disk's alias name
     """
     try:
-        _file = open(source_iso, 'wb')
-        _file.seek((1024 * 1024) - 1)
-        _file.write(str(0))
-        _file.close()
+        with open(source_iso, 'wb') as _file:
+            _file.seek((1024 * 1024) - 1)
+            _file.write(str(0).encode())
     except IOError:
-        raise error.TestFail("Create source_iso failed!")
+        test.fail("Create source_iso failed!")
     disk_class = VMXML.get_device_class('disk')
     disk = disk_class(type_name='file')
     # Static definition for comparison in check_attach()
@@ -67,6 +65,8 @@ def create_attach_xml(update_xmlfile, source_iso, disk_type, target_bus,
         disk.readonly = True
     if disk_mode == "shareable":
         disk.share = True
+    if disk_alias:
+        disk.alias = dict(name=disk_alias)
     disk.xmltreefile.write()
     shutil.copyfile(disk.xml, update_xmlfile)
 
@@ -83,7 +83,8 @@ def is_attached(vmxml_devices, disk_type, source_file, target_dev):
     """
     disks = vmxml_devices.by_device_tag('disk')
     for disk in disks:
-        logging.debug("Check disk XML:\n%s", open(disk['xml']).read())
+        with open(disk['xml']) as _file:
+            logging.debug("Check disk XML:\n%s", _file.read())
         if disk.device != disk_type:
             continue
         if disk.target['dev'] != target_dev:
@@ -123,20 +124,20 @@ def run(test, params, env):
         if option == "":
             continue
         if not bool(virsh.has_command_help_match("update-device", option)):
-            raise error.TestNAError("virsh update-device doesn't support --%s"
-                                    % option)
+            test.cancel("virsh update-device doesn't support --%s"
+                        % option)
 
     # As per RH BZ 961443 avoid testing before behavior changes
     if 'config' in flag_list:
         # SKIP tests using --config if libvirt is 0.9.10 or earlier
         if not libvirt_version.version_compare(0, 9, 10):
-            raise error.TestNAError("BZ 961443: --config behavior change "
-                                    "in version 0.9.10")
+            test.cancel("BZ 961443: --config behavior change "
+                        "in version 0.9.10")
     if 'persistent' in flag_list:
         # SKIP tests using --persistent if libvirt 1.0.5 or earlier
         if not libvirt_version.version_compare(1, 0, 5):
-            raise error.TestNAError("BZ 961443: --persistent behavior change "
-                                    "in version 1.0.5")
+            test.cancel("BZ 961443: --persistent behavior change "
+                        "in version 1.0.5")
 
     # Prepare initial vm state
     vm_name = params.get("main_vm")
@@ -151,16 +152,14 @@ def run(test, params, env):
     disk_mode = params.get("disk_mode", "")
     support_mode = ['readonly', 'shareable']
     if not disk_mode and disk_mode not in support_mode:
-        raise error.TestError("%s not in support mode %s"
-                              % (disk_mode, support_mode))
+        test.error("%s not in support mode %s"
+                   % (disk_mode, support_mode))
 
     # Prepare tmp directory and files.
     orig_iso = os.path.join(test.virtdir, "orig.iso")
     test_iso = os.path.join(test.virtdir, "test.iso")
     test_diff_iso = os.path.join(test.virtdir, "test_diff.iso")
-    update_xmlfile = os.path.join(test.tmpdir, "update.xml")
-    create_attach_xml(update_xmlfile, test_iso, disk_type, target_bus,
-                      target_dev, disk_mode)
+    update_xmlfile = os.path.join(data_dir.get_tmp_dir(), "update.xml")
 
     # This test needs a cdrom/floppy attached first - attach a cdrom/floppy
     # to a shutdown vm. Then decide to restart or not
@@ -168,13 +167,17 @@ def run(test, params, env):
         vm.destroy(gracefully=False)
     # Vm should be in 'shut off' status
     utils_misc.wait_for(lambda: vm.state() == "shut off", 30)
-    create_disk(vm_name, orig_iso, disk_type, target_dev, disk_mode)
+    create_disk(test, vm_name, orig_iso, disk_type, target_dev, disk_mode)
     if start_vm:
         vm.start()
         vm.wait_for_login().close()
         domid = vm.get_id()
     else:
         domid = "domid invalid; domain is shut-off"
+
+    disk_alias = libvirt.get_disk_alias(vm, orig_iso)
+    create_attach_xml(test, update_xmlfile, test_iso, disk_type, target_bus,
+                      target_dev, disk_mode, disk_alias)
 
     # Get remaining parameters for configuration.
     twice = "yes" == params.get("updatedevice_twice", "no")
@@ -199,8 +202,8 @@ def run(test, params, env):
             if diff_iso:
                 # Swap filename of device backing file in update.xml
                 os.remove(update_xmlfile)
-                create_attach_xml(update_xmlfile, test_diff_iso, disk_type,
-                                  target_bus, target_dev, disk_mode)
+                create_attach_xml(test, update_xmlfile, test_diff_iso, disk_type,
+                                  target_bus, target_dev, disk_mode, disk_alias)
         elif vm_ref == "uuid":
             vm_ref = vmxml.uuid
         elif vm_ref == "hex_id":
@@ -298,7 +301,8 @@ def run(test, params, env):
         logging.debug("active_attached: %s", str(active_attached))
         logging.debug("inctive_attached: %s", str(inactive_attached))
         logging.debug("Device XML:")
-        logging.debug(open(update_xmlfile, "r").read())
+        with open(update_xmlfile, "r") as _file:
+            logging.debug(_file.read())
 
     # clean up tmp files
     del vmxml
@@ -307,4 +311,4 @@ def run(test, params, env):
     os.unlink(update_xmlfile)
 
     if errmsg:
-        raise error.TestFail(errmsg)
+        test.fail(errmsg)

@@ -1,7 +1,5 @@
 import logging
 
-from autotest.client.shared import error
-
 from virttest import virsh
 from virttest import libvirt_vm
 from virttest.libvirt_xml import network_xml
@@ -28,8 +26,8 @@ def run(test, params, env):
     # libvirt acl polkit related params
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     virsh_uri = params.get("virsh_uri")
     unprivileged_user = params.get('unprivileged_user')
@@ -45,53 +43,59 @@ def run(test, params, env):
         default_netxml = origin_nets['default']
     except KeyError:
         virsh_instance.close_session()
-        raise error.TestNAError("Test requires default network to exist")
-    # To confirm default network is active
-    if not default_netxml.active:
-        default_netxml.active = True
+        test.cancel("Test requires default network to exist")
+    try:
+        # To confirm default network is active
+        if not default_netxml.active:
+            default_netxml.active = True
 
-    # inactive default according test's need
-    if inactive_default:
-        logging.info("Stopped default network")
-        default_netxml.active = False
+        # inactive default according test's need
+        if inactive_default:
+            logging.info("Stopped default network")
+            default_netxml.active = False
 
-    # State before run command
-    origin_state = virsh_instance.net_state_dict()
-    logging.debug("Origin network(s) state: %s", origin_state)
+        # State before run command
+        origin_state = virsh_instance.net_state_dict()
+        logging.debug("Origin network(s) state: %s", origin_state)
 
-    if net_ref == "netname":
-        net_ref = default_netxml.name
-    elif net_ref == "netuuid":
-        net_ref = default_netxml.uuid
+        if net_ref == "netname":
+            net_ref = default_netxml.name
+        elif net_ref == "netuuid":
+            net_ref = default_netxml.uuid
 
-    if params.get('setup_libvirt_polkit') == 'yes':
-        virsh_dargs = {'uri': virsh_uri, 'unprivileged_user': unprivileged_user,
-                       'debug': False, 'ignore_status': True}
+        if params.get('setup_libvirt_polkit') == 'yes':
+            virsh_dargs = {'uri': virsh_uri, 'unprivileged_user': unprivileged_user,
+                           'debug': False, 'ignore_status': True}
+        if params.get('net_start_readonly', 'no') == 'yes':
+            virsh_dargs = {'uri': uri, 'debug': True, 'readonly': True, 'ignore_status': True}
 
-    # Run test case
-    result = virsh.net_start(net_ref, extra, **virsh_dargs)
-    logging.debug(result)
-    status = result.exit_status
-
-    # Get current net_stat_dict
-    current_state = virsh_instance.net_state_dict()
-    logging.debug("Current network(s) state: %s", current_state)
-    is_default_active = current_state['default']['active']
-
-    # Recover default state to active
-    if not is_default_active:
-        default_netxml.active = True
-
-    virsh_instance.close_session()
-
-    # Check status_error
-    if status_error:
-        if not status:
-            raise error.TestFail("Run successfully with wrong command!")
-    else:
-        if status:
-            raise error.TestFail("Run failed with right command")
+        # Run test case
+        if 'unprivileged_user' in virsh_dargs and status_error:
+            test_virsh = virsh.VirshPersistent(unprivileged_user=virsh_dargs['unprivileged_user'])
+            virsh_dargs.pop('unprivileged_user')
+            result = test_virsh.net_start(net_ref, extra, **virsh_dargs)
+            test_virsh.close_session()
         else:
-            if not is_default_active:
-                raise error.TestFail("Execute cmd successfully but "
-                                     "default is inactive actually.")
+            result = virsh.net_start(net_ref, extra, **virsh_dargs)
+        logging.debug(result)
+        status = result.exit_status
+
+        # Get current net_stat_dict
+        current_state = virsh_instance.net_state_dict()
+        logging.debug("Current network(s) state: %s", current_state)
+        is_default_active = current_state['default']['active']
+
+        # Check status_error
+        if status_error:
+            if not status:
+                test.fail("Run successfully with wrong command!")
+        else:
+            if status:
+                test.fail("Run failed with right command")
+            else:
+                if not is_default_active:
+                    test.fail("Execute cmd successfully but "
+                              "default is inactive actually.")
+    finally:
+        virsh_instance.close_session()
+        virsh.net_start('default', debug=True, ignore_status=True)

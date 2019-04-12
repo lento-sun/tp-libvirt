@@ -1,5 +1,4 @@
 import os
-import platform
 import logging
 import time
 import errno
@@ -7,14 +6,22 @@ import socket
 import threading
 import select
 import platform
+import subprocess
+import re
 
 import aexpect
 
 from virttest import remote
 from virttest import virsh
 from virttest.utils_test import libvirt
+from virttest.utils_conn import TLSConnection
 from virttest.libvirt_xml.vm_xml import VMXML
 from virttest.libvirt_xml.devices import librarian
+from virttest.libvirt_xml.devices.graphics import Graphics
+
+from provider import libvirt_version
+
+from avocado.utils import astring
 
 
 class Console(aexpect.ShellSession):
@@ -24,7 +31,7 @@ class Console(aexpect.ShellSession):
     with qemu VM in different ways.
     """
 
-    def __init__(self, console_type, address, is_server=False):
+    def __init__(self, console_type, address, is_server=False, pki_path='.'):
         """
         Initialize the instance and create socket/fd for connect with.
 
@@ -35,6 +42,7 @@ class Console(aexpect.ShellSession):
                         this should be a string representing the path to be
                         connect with
         :param is_server: Whether this connection act as a server or a client
+        :param pki_path: Where the tls pki file is located
         """
         self.exit = False
         self.address = address
@@ -44,13 +52,47 @@ class Console(aexpect.ShellSession):
         self.read_fd = None
         self.write_fd = None
         self._poll_thread = None
+        self.pki_path = pki_path
         self.linesep = "\n"
         self.prompt = r"^\[.*\][\#\$]\s*$"
         self.status_test_command = "echo $?"
+        self.process = None
 
         if console_type == 'unix':
             self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.socket.connect(address)
+        elif console_type == 'tls':
+            outfilename = '/tmp/gnutls.out'
+            self.read_fd = open(outfilename, 'a+')
+            if is_server:
+                cmd = ('gnutls-serv --echo --x509cafile %s/ca-cert.pem ' %
+                       self.pki_path + '--x509keyfile %s/server-key.pem' %
+                       self.pki_path + ' --x509certfile %s/server-cert.pem' %
+                       self.pki_path)
+                obj = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE,
+                                       stdout=self.read_fd,
+                                       universal_newlines=True)
+            else:
+                cmd = ('gnutls-cli --priority=NORMAL -p5556 --x509cafile=%s'
+                       % self.pki_path + '/ca-cert.pem ' + '127.0.0.1 '
+                       + '--x509certfile=%s' % self.pki_path
+                       + '/client-cert.pem --x509keyfile=%s' % self.pki_path
+                       + '/client-key.pem')
+                obj = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE,
+                                       stdout=self.read_fd,
+                                       universal_newlines=True)
+                obj.stdin.write('\n')
+                time.sleep(50)
+                obj.stdin.write('\n')
+                time.sleep(50)
+                # In python 3, stdin.close() will raise a BrokenPiPeError
+                try:
+                    obj.stdin.close()
+                except socket.error as e:
+                    if e.errno != errno.EPIPE:
+                        # Not a broken pipe
+                        raise
+            self.process = obj
         elif console_type == 'tcp':
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if is_server:
@@ -75,8 +117,8 @@ class Console(aexpect.ShellSession):
                 address + '.out',
                 os.O_RDONLY | os.O_CREAT | os.O_NONBLOCK)
         elif console_type == 'file':
-            self.read_fd = os.open(
-                address, os.O_RDONLY | os.O_CREAT | os.O_NONBLOCK)
+            self.read_fd = open(address,
+                                'r')
 
     def _tcp_thread(self):
         """
@@ -106,21 +148,24 @@ class Console(aexpect.ShellSession):
                 if self.console_type in ['tcp', 'unix']:
                     new_data = self.socket.recv(
                         1024, socket.MSG_DONTWAIT)
-                    data += new_data
+                    data += astring.to_text(new_data, errors='ignore')
                     return data
                 elif self.console_type == 'udp':
                     new_data, self.peer_addr = self.socket.recvfrom(
                         1024, socket.MSG_DONTWAIT)
-                    data += new_data
+                    data += astring.to_text(new_data, errors='ignore')
                     return data
-                elif self.console_type in ['file', 'pipe']:
+                elif self.console_type in ['file', 'pipe', 'tls']:
                     try:
                         read_fds, _, _ = select.select(
                             [self.read_fd], [], [], internal_timeout)
                     except Exception:
                         return data
                     if self.read_fd in read_fds:
-                        new_data = os.read(self.read_fd, 1024)
+                        if self.console_type == 'pipe':
+                            new_data = os.read(self.read_fd, 1024)
+                        else:
+                            new_data = self.read_fd.read(1024)
                         if not new_data:
                             return data
                         data += new_data
@@ -212,15 +257,15 @@ class Console(aexpect.ShellSession):
         :param cont: String to send to the child process.
         """
         if self.console_type in ['tcp', 'unix']:
-            self.socket.sendall(cont)
+            self.socket.sendall(cont.encode())
         elif self.console_type == 'udp':
             if self.peer_addr is None:
                 logging.debug("No peer connection yet.")
             else:
-                self.socket.sendto(cont, self.peer_addr)
+                self.socket.sendto(cont.encode(), self.peer_addr)
         elif self.console_type == 'pipe':
             try:
-                os.write(self.write_fd, cont)
+                os.write(self.write_fd, cont.encode())
             except Exception:
                 pass
         elif self.console_type == 'file':
@@ -233,14 +278,22 @@ class Console(aexpect.ShellSession):
         if self.socket is not None:
             self.socket.close()
         if self.read_fd is not None:
-            os.close(self.read_fd)
+            if self.console_type == 'pipe':
+                os.close(self.read_fd)
+            else:
+                self.read_fd.close()
         if self.write_fd is not None:
-            os.close(self.write_fd)
+            if self.console_type == 'pipe':
+                os.close(self.write_fd)
+            else:
+                self.write_fd.close()
         if self.console_type == 'pipe':
             if os.path.exists(self.address + '.in'):
                 os.remove(self.address + '.in')
             if os.path.exists(self.address + '.out'):
                 os.remove(self.address + '.out')
+        if self.process is not None:
+            self.process.terminate()
 
 
 def run(test, params, env):
@@ -255,13 +308,44 @@ def run(test, params, env):
     5) Shutdown the VM and check whether cleaned up properly
     6) Clean up environment
     """
+
+    def set_targets(serial):
+        """
+        Prepare a serial device XML according to parameters
+        """
+        machine = platform.machine()
+        if "ppc" in machine:
+            serial.target_model = 'spapr-vty'
+            serial.target_type = 'spapr-vio-serial'
+        elif "aarch" in machine:
+            serial.target_model = 'pl011'
+            serial.target_type = 'system-serial'
+        else:
+            serial.target_model = target_type
+            serial.target_type = target_type
+
+    def prepare_spice_graphics_device():
+        """
+        Prepare a spice graphics device XML according to parameters
+        """
+        graphic = Graphics(type_name='spice')
+        graphic.autoport = "yes"
+        graphic.port = "-1"
+        graphic.tlsPort = "-1"
+        return graphic
+
     def prepare_serial_device():
         """
         Prepare a serial device XML according to parameters
         """
-        serial = librarian.get('serial')(serial_type)
+        local_serial_type = serial_type
+        if serial_type == "tls":
+            local_serial_type = "tcp"
+        serial = librarian.get('serial')(local_serial_type)
 
         serial.target_port = "0"
+
+        set_targets(serial)
 
         sources = []
         logging.debug(sources_str)
@@ -278,8 +362,12 @@ def run(test, params, env):
         """
         Prepare a serial device XML according to parameters
         """
-        console = librarian.get('console')(serial_type)
+        local_serial_type = serial_type
+        if serial_type == "tls":
+            local_serial_type = "tcp"
+        console = librarian.get('console')(local_serial_type)
         console.target_type = console_target_type
+        console.target_port = console_target_port
 
         sources = []
         logging.debug(sources_str)
@@ -333,10 +421,14 @@ def run(test, params, env):
         """
         console_cls = librarian.get('console')
 
-        # Predict expected serial and console XML
-        expected_console = console_cls(serial_type)
+        local_serial_type = serial_type
 
-        if serial_type == 'udp':
+        if serial_type == 'tls':
+            local_serial_type = 'tcp'
+        # Predict expected serial and console XML
+        expected_console = console_cls(local_serial_type)
+
+        if local_serial_type == 'udp':
             sources = []
             for source in serial_dev.sources:
                 if 'service' in source and 'mode' not in source:
@@ -347,8 +439,8 @@ def run(test, params, env):
 
         expected_console.sources = sources
 
-        if serial_type == 'tcp':
-            if 'protocol_type' in serial_type:
+        if local_serial_type == 'tcp':
+            if 'protocol_type' in local_serial_type:
                 expected_console.protocol_type = serial_dev.protocol_type
             else:
                 expected_console.protocol_type = "raw"
@@ -380,11 +472,13 @@ def run(test, params, env):
 
         if console_target_type == 'serial':
             serial_cls = librarian.get('serial')
-            expected_serial = serial_cls(serial_type)
+            expected_serial = serial_cls(local_serial_type)
             expected_serial.sources = sources
 
-            if serial_type == 'tcp':
-                if 'protocol_type' in serial_type:
+            set_targets(expected_serial)
+
+            if local_serial_type == 'tcp':
+                if 'protocol_type' in local_serial_type:
                     expected_serial.protocol_type = serial_dev.protocol_type
                 else:
                     expected_serial.protocol_type = "raw"
@@ -393,10 +487,16 @@ def run(test, params, env):
                 test.fail("Expect exist serial device, "
                           "but found none.")
             cur_serial = serial_cls.new_from_element(serial_elem)
+            if target_type == 'pci-serial':
+                if cur_serial.address is None:
+                    test.fail("Expect serial device address is not assigned")
+                else:
+                    logging.debug("Serial address is: %s", cur_serial.address)
+
             logging.debug("Expected serial XML is:\n%s", expected_serial)
             logging.debug("Current serial XML is:\n%s", cur_serial)
             # Compare current serial and console with oracle.
-            if not expected_serial == cur_serial:
+            if target_type != 'pci-serial' and not expected_serial == cur_serial:
                 # "==" has been override
                 test.fail("Expect serial device:\n%s\nBut got:\n "
                           "%s" % (expected_serial, cur_serial))
@@ -411,6 +511,11 @@ def run(test, params, env):
             # Unix socket path should match SELinux label
             socket_path = '/var/lib/libvirt/qemu/virt-test'
             console = Console('unix', socket_path, is_server)
+        elif serial_type == 'tls':
+            host = '127.0.0.1'
+            service = 5556
+            console = Console('tls', (host, service), is_server,
+                              custom_pki_path)
         elif serial_type == 'tcp':
             host = '127.0.0.1'
             service = 2445
@@ -463,7 +568,7 @@ def run(test, params, env):
         # Get expected serial and console options from params
         if serial_type == 'dev':
             ser_type = 'tty'
-        elif serial_type in ['unix', 'tcp']:
+        elif serial_type in ['unix', 'tcp', 'tls']:
             ser_type = 'socket'
         else:
             ser_type = serial_type
@@ -474,12 +579,15 @@ def run(test, params, env):
                 if 'path' in source:
                     path = source['path']
             if serial_type == 'file':
-                # This fdset number should be make flexible later
-                exp_ser_opts.append('path=/dev/fdset/2')
+                # Use re to make this fdset number flexible
+                exp_ser_opts.append('path=/dev/fdset/\d+')
                 exp_ser_opts.append('append=on')
+            elif serial_type == 'unix':
+                # Use re to make this fd number flexible
+                exp_ser_opts.append('fd=\d+')
             else:
                 exp_ser_opts.append('path=%s' % path)
-        elif serial_type in ['tcp']:
+        elif serial_type in ['tcp', 'tls']:
             for source in serial_dev.sources:
                 if 'host' in source:
                     host = source['host']
@@ -506,7 +614,7 @@ def run(test, params, env):
             exp_ser_opts.append('localaddr=%s' % localaddr)
             exp_ser_opts.append('localport=%s' % localport)
 
-        if serial_type in ['unix', 'tcp', 'udp']:
+        if serial_type in ['unix', 'tcp', 'udp', 'tls']:
             for source in serial_dev.sources:
                 if 'mode' in source:
                     mode = source['mode']
@@ -514,35 +622,50 @@ def run(test, params, env):
                 exp_ser_opts.append('server')
                 exp_ser_opts.append('nowait')
 
+        if serial_type == 'tls':
+            exp_ser_opts.append('tls-creds=objcharserial0_tls0')
+
         exp_ser_opt = ','.join(exp_ser_opts)
 
         if "ppc" in platform.machine():
-            exp_ser_devs = ['spapr-vty', 'chardev=charserial0', 'reg=0x30000000']
+            exp_ser_devs = ['spapr-vty', 'chardev=charserial0',
+                            'reg=0x30000000']
+            if libvirt_version.version_compare(3, 9, 0):
+                exp_ser_devs.insert(2, 'id=serial0')
         else:
-            exp_ser_devs = ['isa-serial', 'chardev=charserial0', 'id=serial0']
+            logging.debug('target_type: %s', target_type)
+            if target_type == 'pci-serial':
+                exp_ser_devs = ['pci-serial', 'chardev=charserial0',
+                                'id=serial0', 'bus=pci.\d+', 'addr=0x\d+']
+            else:
+                exp_ser_devs = ['isa-serial', 'chardev=charserial0',
+                                'id=serial0']
         exp_ser_dev = ','.join(exp_ser_devs)
 
-        if console_target_type != 'serial' or serial_type in ['spiceport']:
+        if console_target_type != 'serial' or serial_type == 'spicevmc':
             exp_ser_opt = None
             exp_ser_dev = None
+        logging.debug("exp_ser_opt: %s", exp_ser_opt)
+        logging.debug("ser_opt: %s", ser_opt)
 
         # Check options against expectation
-        if ser_opt != exp_ser_opt:
+        if exp_ser_opt is not None and re.match(exp_ser_opt, ser_opt) is None:
             test.fail('Expect get qemu command serial option "%s", '
                       'but got "%s"' % (exp_ser_opt, ser_opt))
-        if ser_dev != exp_ser_dev:
+        if exp_ser_dev is not None and ser_dev is not None \
+           and re.match(exp_ser_dev, ser_dev) is None:
             test.fail(
                 'Expect get qemu command serial device option "%s", '
                 'but got "%s"' % (exp_ser_dev, ser_dev))
 
         if console_target_type == 'virtio':
-            exp_con_opts = [serial_type, 'id=charconsole0']
+            exp_con_opts = [serial_type, 'id=charconsole1']
             exp_con_opt = ','.join(exp_con_opts)
 
             exp_con_devs = []
             if console_target_type == 'virtio':
                 exp_con_devs.append('virtconsole')
-            exp_con_devs += ['chardev=charconsole0', 'id=console0']
+            exp_con_devs += ['chardev=charconsole1', 'id=console1']
             exp_con_dev = ','.join(exp_con_devs)
             if con_opt != exp_con_opt:
                 test.fail(
@@ -558,7 +681,7 @@ def run(test, params, env):
         Check whether console works properly by read the result for read only
         console and login and emit a command for read write console.
         """
-        if serial_type in ['file']:
+        if serial_type in ['file', 'tls']:
             _, output = console.read_until_output_matches(['.*[Ll]ogin:'])
         else:
             console.wait_for_login(username, password)
@@ -566,19 +689,24 @@ def run(test, params, env):
             logging.debug("Command status: %s", status)
             logging.debug("Command output: %s", output)
 
-    def check_cleanup():
+    def cleanup(objs_list):
         """
-        Clean up residue file.
+        Clean up test environment
         """
         if serial_type == 'file':
             if os.path.exists('/var/log/libvirt/virt-test'):
                 os.remove('/var/log/libvirt/virt-test')
 
+        # recovery test environment
+        for obj in objs_list:
+            obj.auto_recover = True
+            del obj
+
     def get_console_type():
         """
         Check whether console should be started before or after guest starting.
         """
-        if serial_type in ['tcp', 'unix', 'udp']:
+        if serial_type in ['tcp', 'unix', 'udp', 'tls']:
             for source in serial_dev.sources:
                 if 'mode' in source and source['mode'] == 'connect':
                     return 'server'
@@ -593,29 +721,72 @@ def run(test, params, env):
     username = params.get('username')
     password = params.get('password')
     console_target_type = params.get('console_target_type', 'serial')
+    target_type = params.get('target_type', 'isa-serial')
+    console_target_port = params.get('console_target_port', '0')
+    second_serial_console = params.get('second_serial_console', 'no') == 'yes'
+    custom_pki_path = params.get('custom_pki_path', '/etc/pki/libvirt-chardev')
+    auto_recover = params.get('auto_recover', 'no')
+    client_pwd = params.get('client_pwd', None)
+    server_pwd = params.get('server_pwd', None)
+
+    args_list = [client_pwd, server_pwd]
+
+    for arg in args_list:
+        if arg and arg.count("ENTER.YOUR."):
+            raise test.fail("Please assign a value for %s!" % arg)
+
     vm_name = params.get('main_vm', 'virt-tests-vm1')
     vm = env.get_vm(vm_name)
+
+    # it's used to clean up TLS objs later
+    objs_list = []
 
     vm_xml = VMXML.new_from_inactive_dumpxml(vm_name)
     vm_xml_backup = vm_xml.copy()
     try:
-        vm_xml.remove_all_device_by_type('serial')
-        vm_xml.remove_all_device_by_type('console')
+        if console_target_type != 'virtio':
+            vm_xml.remove_all_device_by_type('serial')
+            vm_xml.remove_all_device_by_type('console')
+        if serial_type == "tls":
+            test_dict = dict(params)
+            tls_obj = TLSConnection(test_dict)
+            if auto_recover == "yes":
+                objs_list.append(tls_obj)
+            tls_obj.conn_setup(False, True, True)
+
         serial_dev = prepare_serial_device()
-        if console_target_type == 'serial':
+        if console_target_type == 'serial' or second_serial_console:
             logging.debug('Serial device:\n%s', serial_dev)
             vm_xml.add_device(serial_dev)
+            if serial_type == "spiceport":
+                spice_graphics_dev = prepare_spice_graphics_device()
+                logging.debug('Spice graphics device:\n%s', spice_graphics_dev)
+                vm_xml.add_device(spice_graphics_dev)
+
         console_dev = prepare_console_device()
         logging.debug('Console device:\n%s', console_dev)
         vm_xml.add_device(console_dev)
+        if second_serial_console:
+            console_target_type = 'serial'
+            console_target_port = '1'
+            console_dev = prepare_console_device()
+            logging.debug('Console device:\n%s', console_dev)
+            vm_xml.add_device(console_dev)
+            vm_xml.undefine()
+            res = virsh.define(vm_xml.xml)
+            if res.stderr.find(r'Only the first console can be a serial port'):
+                logging.debug("Test only the first console can be a serial"
+                              "succeeded")
+                return
+            test.fail("Test only the first console can be serial failed.")
 
         console_type = get_console_type()
 
         if not define_and_check():
             logging.debug("Can't define the VM, exiting.")
             return
-
-        check_xml()
+        if console_target_type != 'virtio':
+            check_xml()
 
         expected_fails = []
         if serial_type == 'nmdm' and platform.system() != 'FreeBSD':
@@ -630,18 +801,17 @@ def run(test, params, env):
         if res.exit_status:
             logging.debug("Can't start the VM, exiting.")
             return
-
         check_qemu_cmdline()
-
         # Prepare console after start when console is client
         if console_type == 'client':
             console = prepare_serial_console()
 
-        if console_type is not None:
+        if (console_type is not None and serial_type != 'tls' and
+           console_type != 'server'):
             check_serial_console(console, username, password)
 
         vm.destroy()
 
-        check_cleanup()
     finally:
+        cleanup(objs_list)
         vm_xml_backup.sync()

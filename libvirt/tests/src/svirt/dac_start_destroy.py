@@ -113,6 +113,7 @@ def run(test, params, env):
         sec_dict['label'] = sec_label
     set_sec_label = "yes" == params.get("set_sec_label", "no")
     set_qemu_conf = "yes" == params.get("set_qemu_conf", "no")
+    qemu_no_usr_grp = "yes" == params.get("qemu_no_usr_grp", "no")
     # Get qemu.conf config variables
     qemu_user = params.get("qemu_user", None)
     qemu_group = params.get("qemu_group", None)
@@ -130,20 +131,21 @@ def run(test, params, env):
     disks = vm.get_disk_devices()
     backup_labels_of_disks = {}
     qemu_disk_mod = False
-    for disk in disks.values():
-        disk_path = disk['source']
-        f = os.open(disk_path, 0)
-        stat_re = os.fstat(f)
-        backup_labels_of_disks[disk_path] = "%s:%s" % (stat_re.st_uid,
-                                                       stat_re.st_gid)
-        label_list = img_label.split(":")
-        os.chown(disk_path, int(label_list[0]), int(label_list[1]))
-        os.close(f)
-        st = os.stat(disk_path)
-        if not bool(st.st_mode & stat.S_IWGRP):
-            # add group wirte mode to disk by chmod g+w
-            os.chmod(disk_path, st.st_mode | stat.S_IWGRP)
-            qemu_disk_mod = True
+    if (not status_error) and (not dynamic_ownership):
+        for disk in list(disks.values()):
+            disk_path = disk['source']
+            f = os.open(disk_path, 0)
+            stat_re = os.fstat(f)
+            backup_labels_of_disks[disk_path] = "%s:%s" % (stat_re.st_uid,
+                                                           stat_re.st_gid)
+            label_list = img_label.split(":")
+            os.chown(disk_path, int(label_list[0]), int(label_list[1]))
+            os.close(f)
+            st = os.stat(disk_path)
+            if not bool(st.st_mode & stat.S_IWGRP):
+                # add group wirte mode to disk by chmod g+w
+                os.chmod(disk_path, st.st_mode | stat.S_IWGRP)
+                qemu_disk_mod = True
 
     # Set selinux of host.
     backup_sestatus = utils_selinux.get_status()
@@ -210,7 +212,6 @@ def run(test, params, env):
             if set_process_name:
                 qemu_conf.set_process_name = set_process_name
             logging.debug("the qemu.conf content is: %s" % qemu_conf)
-            libvirtd.restart()
 
         if set_sec_label:
             # Transform seclabel to "uid:gid"
@@ -228,6 +229,7 @@ def run(test, params, env):
 
         # Start VM to check the qemu process and image.
         try:
+            libvirtd.restart()
             vm.start()
             # Start VM successfully.
             # VM with seclabel can access the image with the context.
@@ -242,7 +244,7 @@ def run(test, params, env):
             vm_context = "%s:%s" % (vm_process_uid, vm_process_gid)
 
             # Get vm image label when VM is running
-            f = os.open(disks.values()[0]['source'], 0)
+            f = os.open(list(disks.values())[0]['source'], 0)
             stat_re = os.fstat(f)
             disk_context = "%s:%s" % (stat_re.st_uid, stat_re.st_gid)
             os.close(f)
@@ -265,7 +267,8 @@ def run(test, params, env):
                                           "=%s" % disk_context +
                                           ", sec_label_trans=%s."
                                           % sec_label_trans)
-            elif set_qemu_conf and not security_default_confined:
+            elif(set_qemu_conf and not security_default_confined and not
+                 qemu_no_usr_grp):
                 if vm_context != qemu_conf_label_trans:
                     test.fail("Label of VM processs is not expected"
                               " after starting.\nDetail: vm_context="
@@ -287,16 +290,16 @@ def run(test, params, env):
                     chk_str = "-name %s,process=qemu:%s" % (vm_name, vm_name)
                 cmd = "ps -p %s -o command=" % vm_pid
                 result = process.run(cmd, shell=True)
-                if chk_str in result.stdout:
+                if chk_str in result.stdout_text:
                     logging.debug("%s found in vm process command: %s" %
-                                  (chk_str, result.stdout))
+                                  (chk_str, result.stdout_text))
                 else:
                     test.fail("%s not in vm process command: %s" %
-                              (chk_str, result.stdout))
+                              (chk_str, result.stdout_text))
 
             # Check the label of disk after VM being destroyed.
             vm.destroy()
-            f = os.open(disks.values()[0]['source'], 0)
+            f = os.open(list(disks.values())[0]['source'], 0)
             stat_re = os.fstat(f)
             img_label_after = "%s:%s" % (stat_re.st_uid, stat_re.st_gid)
             os.close(f)
@@ -324,7 +327,7 @@ def run(test, params, env):
                                   "Detail: img_label_after=%s, "
                                   "img_label=%s.\n"
                                   % (img_label_after, img_label))
-        except virt_vm.VMStartError, e:
+        except virt_vm.VMStartError as e:
             # Starting VM failed.
             # VM with seclabel can not access the image with the context.
             if not status_error:
@@ -334,7 +337,7 @@ def run(test, params, env):
                 if set_sec_label:
                     if sec_label:
                         if sec_relabel == "yes" and sec_label_trans == "0:0":
-                            if set_qemu_conf:
+                            if set_qemu_conf and not qemu_no_usr_grp:
                                 if qemu_conf_label_trans == "107:107":
                                     logging.debug(err_msg)
                         elif sec_relabel == "no" and sec_label_trans == "0:0":
@@ -345,7 +348,7 @@ def run(test, params, env):
                               "error: %s" % e)
     finally:
         # clean up
-        for path, label in backup_labels_of_disks.items():
+        for path, label in list(backup_labels_of_disks.items()):
             label_list = label.split(":")
             os.chown(path, int(label_list[0]), int(label_list[1]))
             if qemu_disk_mod:

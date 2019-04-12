@@ -1,8 +1,8 @@
 import os
 import logging
 
-from autotest.client.shared import error
-
+from avocado.core import exceptions
+from avocado.utils import process
 from virttest import virsh
 
 _SYSFS_MEMORY_KSM_PATH = "/sys/kernel/mm/ksm"
@@ -39,10 +39,11 @@ def get_ksm_values_and_change_list():
                  'shm_full_scans': 'full_scans',
                  'shm_merge_across_nodes': 'merge_across_nodes'}
 
-    for k, v in ksm_files.items():
+    for k, v in list(ksm_files.items()):
         sharing_file = os.path.join(_SYSFS_MEMORY_KSM_PATH, v)
         if os.access(sharing_file, os.R_OK):
-            ksm_params[k] = open(sharing_file, 'r').read().strip()
+            with open(sharing_file, 'r') as ksm_file:
+                ksm_params[k] = ksm_file.read().strip()
         else:
             # The 'merge_across_nodes' is supported by specific kernel
             if v in change_list:
@@ -60,7 +61,7 @@ def check_node_memtune(params, ksm_dicts):
     change_list = ksm_dicts.get('change_list')
 
     if change_parameters == "no":
-        for k in params.keys():
+        for k in list(params.keys()):
             if params[k] != ksm_dicts[k]:
                 logging.error("To expect %s value is %s", k, ksm_dicts[k])
                 return False
@@ -74,7 +75,7 @@ def check_node_memtune(params, ksm_dicts):
     return True
 
 
-def get_node_memtune_parameter(params):
+def get_node_memtune_parameter(test, params):
     """
     Get the node memory parameters
     :params: the parameter dictionary
@@ -100,20 +101,20 @@ def get_node_memtune_parameter(params):
         if status:
             logging.info("It's an expected error: %s", result.stderr)
         else:
-            raise error.TestFail("%d not a expected command "
-                                 "return value" % status)
+            test.fail("%d not a expected command "
+                      "return value" % status)
     elif status_error == "no":
         if status:
-            raise error.TestFail(result.stderr)
+            test.fail(result.stderr)
         else:
             if check_node_memtune(_params, ksm_dicts):
                 logging.info(result)
             else:
-                raise error.TestFail("The memory parameters "
-                                     "mismatch with result")
+                test.fail("The memory parameters "
+                          "mismatch with result")
 
 
-def set_node_memtune_parameter(params):
+def set_node_memtune_parameter(test, params):
     """
     Set the node memory parameters
     :params: the parameter dictionary
@@ -124,7 +125,7 @@ def set_node_memtune_parameter(params):
     shm_merge_across_nodes = params.get("shm_merge_across_nodes")
 
     result = virsh.node_memtune(shm_pages_to_scan, shm_sleep_millisecs,
-                                shm_merge_across_nodes, options=options)
+                                shm_merge_across_nodes, options=options, debug=True)
 
     status = result.exit_status
 
@@ -143,17 +144,29 @@ def set_node_memtune_parameter(params):
         if status:
             logging.info("It's an expected error: %s", result.stderr)
         else:
-            raise error.TestFail("%d not a expected command "
-                                 "return value" % status)
+            test.fail("%d not a expected command "
+                      "return value" % status)
     elif status_error == "no":
         if status:
-            raise error.TestFail(result.stderr)
+            test.fail(result.stderr)
         else:
             if check_node_memtune(params, ksm_dicts):
-                logging.info(result)
+                logging.info(result.stdout)
             else:
-                raise error.TestFail("The memory parameters "
-                                     "mismatch with result")
+                test.fail("The memory parameters "
+                          "mismatch with result")
+
+
+def check_virsh_manual(cmd, test):
+    """
+    Check virsh manual of given cmd
+    :param cmd: The virsh cmd
+    :param test: The test object
+    """
+    check_cmd = "man virsh| grep %s" % cmd
+    result = process.run(check_cmd, shell=True, ignore_status=False)
+    if result.exit_status:
+        test.fail("Failed to run '%s'" % check_cmd)
 
 
 def run(test, params, env):
@@ -173,6 +186,7 @@ def run(test, params, env):
     # Run test case
     status_error = params.get("status_error", "no")
     change_parameters = params.get("change_parameters", "no")
+    check_manual = ("yes" == params.get("check_manual", "no"))
 
     (ksm_params, change_list) = get_ksm_values_and_change_list()
 
@@ -181,41 +195,44 @@ def run(test, params, env):
 
     # positive and negative testing #########
 
+    if check_manual:
+        check_virsh_manual("node-memory-tune", test)
+
     if status_error == "no":
         if change_parameters == "no":
             try:
-                get_node_memtune_parameter(params)
-            except error.TestFail, detail:
+                get_node_memtune_parameter(test, params)
+            except exceptions.TestFail as detail:
                 # Recovery ksm relevant files contents
                 recovery_ksm_files_contents(ksm_backup, change_list)
-                raise error.TestFail("Failed to get node memory parameters.\n"
-                                     "Detail: %s." % detail)
+                test.fail("Failed to get node memory parameters.\n"
+                          "Detail: %s." % detail)
         else:
             try:
-                set_node_memtune_parameter(params)
-            except error.TestFail, detail:
+                set_node_memtune_parameter(test, params)
+            except exceptions.TestFail as detail:
                 # Recovery ksm relevant files contents
                 recovery_ksm_files_contents(ksm_backup, change_list)
-                raise error.TestFail("Failed to set node memory parameters.\n"
-                                     "Detail: %s." % detail)
+                test.fail("Failed to set node memory parameters.\n"
+                          "Detail: %s." % detail)
 
     if status_error == "yes":
         if change_parameters == "no":
             try:
-                get_node_memtune_parameter(params)
-            except error.TestFail, detail:
+                get_node_memtune_parameter(test, params)
+            except exceptions.TestFail as detail:
                 # Recovery ksm relevant files contents
                 recovery_ksm_files_contents(ksm_backup, change_list)
-                raise error.TestFail("Failed to get node memory parameters.\n"
-                                     "Detail: %s." % detail)
+                test.fail("Failed to get node memory parameters.\n"
+                          "Detail: %s." % detail)
         else:
             try:
-                set_node_memtune_parameter(params)
-            except error.TestFail, detail:
+                set_node_memtune_parameter(test, params)
+            except exceptions.TestFail as detail:
                 # Recovery ksm relevant files contents
                 recovery_ksm_files_contents(ksm_backup, change_list)
-                raise error.TestFail("Failed to set node memory parameters.\n"
-                                     "Detail: %s." % detail)
+                test.fail("Failed to set node memory parameters.\n"
+                          "Detail: %s." % detail)
 
     # Recovery ksm relevant files contents
     recovery_ksm_files_contents(ksm_backup, change_list)

@@ -4,6 +4,7 @@ import re
 import signal
 import time
 import aexpect
+import platform
 
 from subprocess import PIPE
 from subprocess import Popen
@@ -19,11 +20,14 @@ from virttest import utils_config
 from virttest import utils_libvirtd
 from virttest import utils_misc
 from virttest import utils_netperf
+from virttest import utils_package
 from virttest import utils_selinux
 from virttest import utils_test
 from virttest import virsh
 from virttest import virt_vm
+
 from virttest.libvirt_xml import vm_xml
+from virttest.libvirt_xml import pool_xml
 from virttest.libvirt_xml.devices.disk import Disk
 from virttest.libvirt_xml.devices.smartcard import Smartcard
 from virttest.libvirt_xml.devices.sound import Sound
@@ -36,8 +40,47 @@ from virttest.utils_net import IPv6Manager
 from virttest.utils_net import block_specific_ip_by_time
 from virttest.utils_net import check_listening_port_remote_by_service
 from virttest.utils_test import libvirt
+from virttest.compat_52lts import decode_to_text as to_text
+
+from provider import libvirt_version
 
 MIGRATE_RET = False
+
+
+def destroy_active_pool_on_remote(params):
+    """
+    This is to destroy active pool with same target path as pool_target
+    on remote host
+    :param params: a dict for parameters
+    :return True if successful, otherwise False
+    """
+    ret = True
+
+    remote_ip = params.get("migrate_dest_host")
+    remote_user = params.get("migrate_dest_user", "root")
+    remote_pwd = params.get("migrate_dest_pwd")
+
+    virsh_dargs = {'remote_ip': remote_ip, 'remote_user': remote_user,
+                   'remote_pwd': remote_pwd, 'unprivileged_user': None,
+                   'ssh_remote_auth': True}
+
+    try:
+        remote_session = virsh.VirshPersistent(**virsh_dargs)
+        active_pools = remote_session.pool_list(option="--name")
+
+        for pool in active_pools.stdout.strip().split("\n"):
+            if pool is not '':
+                pool_dumpxml = pool_xml.PoolXML.new_from_dumpxml(pool, remote_session)
+                if(pool_dumpxml.target_path == params.get("pool_target")):
+                    ret = remote_session.pool_destroy(pool)
+    except Exception as e:
+        logging.error("Exception when destroy active pool on target: %s", str(e))
+        raise e
+    finally:
+        if remote_session:
+            remote_session.close_session()
+
+    return ret
 
 
 def create_destroy_pool_on_remote(action, params):
@@ -102,6 +145,11 @@ def check_output(output_msg, params):
     :raise TestSkipError: raised if the known error is found together
                           with some conditions satisfied
     """
+    err_msg = params.get("err_msg", None)
+    if err_msg and err_msg in output_msg:
+        logging.debug("Expected error '%s' was found", err_msg)
+        return
+
     ERR_MSGDICT = {"Bug 1249587": "error: Operation not supported: " +
                    "pre-creation of storage targets for incremental " +
                    "storage migration is not supported",
@@ -110,7 +158,9 @@ def check_output(output_msg, params):
                    "this feature or command is not currently supported",
                    "ERROR 2": "error: Cannot access storage file",
                    "ERROR 3": "Unable to read TLS confirmation: " +
-                   "Input/output error"}
+                   "Input/output error",
+                   "ERROR 4": "error: Unsafe migration: Migration " +
+                   "without shared storage is unsafe"}
 
     # Check for special case firstly
     migrate_disks = "yes" == params.get("migrate_disks")
@@ -119,9 +169,12 @@ def check_output(output_msg, params):
         logging.debug("To check for migrate-disks...")
         disk = params.get("attach_A_disk_source")
         last_msg = "(as uid:107, gid:107): No such file or directory"
-        expect_msg = "%s '%s' %s" % (ERR_MSGDICT["ERROR 2"],
-                                     disk,
-                                     last_msg)
+        if not libvirt_version.version_compare(4, 5, 0):
+            expect_msg = "%s '%s' %s" % (ERR_MSGDICT["ERROR 2"],
+                                         disk,
+                                         last_msg)
+        else:
+            expect_msg = ERR_MSGDICT["ERROR 4"]
         if output_msg.find(expect_msg) >= 0:
             logging.debug("The expected error '%s' was found", expect_msg)
             return
@@ -162,7 +215,7 @@ def migrate_vm(params):
     if vm_name is None:
         vm_name = params.get("main_vm", "")
     uri = params.get("desuri")
-    options = params.get("virsh_options", "--live --verbose --unsafe")
+    options = params.get("virsh_options", "--live --verbose")
     extra = params.get("extra_args", "")
     su_user = params.get("su_user", "")
     auth_user = params.get("server_user")
@@ -254,7 +307,7 @@ def add_disk_xml(device_type, source_file,
         exceptions.TestSkipError("Only support 'cdrom' and 'floppy'"
                                  " device type: %s" % device_type)
 
-    dev_dict = {'cdrom': {'bus': 'ide', 'dev': 'hdc'},
+    dev_dict = {'cdrom': {'bus': 'scsi', 'dev': 'sdb'},
                 'floppy': {'bus': 'fdc', 'dev': 'fda'}}
     if image_size:
         cmd = "qemu-img create %s %s" % (source_file, image_size)
@@ -374,7 +427,7 @@ def get_cpu_xml_from_virsh_caps(runner=None):
     cmd = "virsh capabilities | awk '/<cpu>/,/<\/cpu>/'"
     out = ""
     if not runner:
-        out = process.system_output(cmd, shell=True)
+        out = to_text(process.system_output(cmd, shell=True))
     else:
         out = runner(cmd)
 
@@ -479,7 +532,7 @@ def delete_video_device(vm_name):
     for graphic in graphics:
         vmxml.del_device(graphic)
     vmxml.sync()
-    vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+    vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
     logging.debug("The VM XML after deleting video device: \n%s", vm_xml_cxt)
 
 
@@ -776,7 +829,7 @@ def check_vm_disk_after_migration(vm, params):
     cmdres = remote_vm_obj.run_command(vm_ip, cmd, ignore_status=True)
     if cmdres.exit_status:
         raise exceptions.TestFail("Command '%s' result: %s\n", cmd, cmdres)
-    disks = cmdres.stdout.split("\n")
+    disks = cmdres.stdout.strip().split("\n")
     logging.debug("Get disks in remote VM: %s", disks)
     for disk in disks:
         if disk == '' or disk == '/dev/vda' or disk.count('mapper') > 0:
@@ -904,7 +957,7 @@ def check_domjobinfo_on_complete(test, source_jobinfo, target_jobinfo):
     for key, value in source_info.items():
         if key in ["Expected downtime"]:
             continue
-        if not target_info.has_key(key):
+        if key not in target_info:
             test.fail("The domjobinfo on target host "
                       "does not has the field: '%s'" % key)
 
@@ -914,7 +967,7 @@ def check_domjobinfo_on_complete(test, source_jobinfo, target_jobinfo):
                    "Operation"]:
             continue
         else:
-            if cmp(value, target_value) != 0:
+            if value != target_value:
                 test.fail("The value '%s' for '%s' on source "
                           "host should be equal to the value "
                           "'%s' on target host"
@@ -1002,7 +1055,7 @@ def run(test, params, env):
     reboot_vm = "yes" == test_dict.get("reboot_vm", "no")
     abort_job = "yes" == test_dict.get("abort_job", "no")
     ctrl_c = "yes" == test_dict.get("ctrl_c", "no")
-    virsh_options = test_dict.get("virsh_options", "--verbose --live --unsafe")
+    virsh_options = test_dict.get("virsh_options", "--verbose --live")
     remote_path = test_dict.get("remote_libvirtd_conf",
                                 "/etc/libvirt/libvirtd.conf")
     log_file = test_dict.get("libvirt_log", "/var/log/libvirt/libvirtd.log")
@@ -1078,6 +1131,7 @@ def run(test, params, env):
     cpu_set = "yes" == test_dict.get("cpu_set", "no")
     vcpu_num = test_dict.get("vcpu_num", "1")
 
+    enable_stress_test = "yes" == test_dict.get("enable_stress_test", "no")
     stress_type = test_dict.get("stress_type")
     stress_args = test_dict.get("stress_args")
 
@@ -1112,7 +1166,7 @@ def run(test, params, env):
     src_uri = test_dict.get("migration_source_uri", "qemu:///system")
 
     # Pre-creation image parameters
-    target_pool_name = test_dict.get("target_pool_name", "temp_pool_1")
+    target_pool_name = test_dict.get("target_pool_name")
     target_pool_type = test_dict.get("target_pool_type", "dir")
 
     # disk_ports for storage migration used by nbd
@@ -1135,7 +1189,7 @@ def run(test, params, env):
     os_ver_cmd = "cat /etc/redhat-release"
 
     if os_ver_from:
-        curr_os_ver = process.system_output(os_ver_cmd, shell=True)
+        curr_os_ver = to_text(process.system_output(os_ver_cmd, shell=True))
         if os_ver_from not in curr_os_ver:
             raise exceptions.TestSkipError("The current OS is %s"
                                            % curr_os_ver)
@@ -1208,7 +1262,7 @@ def run(test, params, env):
     first_disk = vm.get_first_disk_devices()
     disk_source = first_disk['source']
     logging.debug("disk source: %s", disk_source)
-    curr_vm_xml = process.system_output('cat %s' % vmxml_backup.xml, shell=True)
+    curr_vm_xml = to_text(process.system_output('cat %s' % vmxml_backup.xml, shell=True))
     logging.debug("The current VM XML contents: \n%s", curr_vm_xml)
     orig_image_name = os.path.basename(disk_source)
 
@@ -1256,7 +1310,7 @@ def run(test, params, env):
                            target, transport=iscsi_transport)
 
             vmxml_iscsi = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
-            curr_vm_xml = process.system_output('cat %s' % vmxml_iscsi.xml, shell=True)
+            curr_vm_xml = to_text(process.system_output('cat %s' % vmxml_iscsi.xml, shell=True))
             logging.debug("The current VM XML contents: \n%s", curr_vm_xml)
 
         del_vm_video_dev = "yes" == test_dict.get("del_vm_video_dev", "no")
@@ -1277,14 +1331,14 @@ def run(test, params, env):
         if watchdog_model:
             prepare_guest_watchdog(vm_name, vm, watchdog_model, watchdog_action,
                                    watchdog_module_args)
-            curr_vm_xml = process.system_output('cat %s' % vmxml_backup.xml, shell=True)
+            curr_vm_xml = to_text(process.system_output('cat %s' % vmxml_backup.xml, shell=True))
             logging.debug("The current VM XML contents: \n%s", curr_vm_xml)
 
         smartcard_mode = test_dict.get("smartcard_mode")
         smartcard_type = test_dict.get("smartcard_type")
         if smartcard_mode and smartcard_type:
             add_smartcard_device(vm_name, smartcard_type, smartcard_mode)
-            curr_vm_xml = process.system_output('cat %s' % vmxml_backup.xml, shell=True)
+            curr_vm_xml = to_text(process.system_output('cat %s' % vmxml_backup.xml, shell=True))
             logging.debug("The current VM XML contents: \n%s", curr_vm_xml)
 
         pm_mem_enabled = test_dict.get("pm_mem_enabled", "no")
@@ -1302,7 +1356,7 @@ def run(test, params, env):
         if nfs_mount_dir:
             cmd = "mkdir -p %s" % nfs_mount_dir
             logging.debug("Make sure %s exists both local and remote", nfs_mount_dir)
-            output = process.system_output(cmd, shell=True)
+            output = to_text(process.system_output(cmd, shell=True))
             if output:
                 raise exceptions.TestFail("Failed to run '%s' on the local : %s"
                                           % (cmd, output))
@@ -1344,13 +1398,13 @@ def run(test, params, env):
             libvirt.update_vm_disk_source(vm_name, target_image_path,
                                           target_image_name, source_type)
 
-        vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+        vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
         logging.debug("The VM XML with new disk source: \n%s", vm_xml_cxt)
 
         # Prepare to update VM first disk driver cache
         disk_name = test_dict.get("disk_driver_name")
         disk_type = test_dict.get("disk_driver_type")
-        disk_cache = test_dict.get("disk_driver_cache")
+        disk_cache = test_dict.get("disk_driver_cache", "none")
         if disk_name or disk_type or disk_cache:
             update_disk_driver(vm_name, disk_name, disk_type, disk_cache)
 
@@ -1397,14 +1451,14 @@ def run(test, params, env):
             build_disk_xml(vm_name, disk_format, host_ip, disk_src_protocol,
                            vol_name, disk_img, gluster_transport)
 
-            vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+            vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
             logging.debug("The VM XML with gluster disk source: \n%s", vm_xml_cxt)
 
         # generate remote IP
         if target_ip == "":
-            if config_ipv6 == "yes" and ipv6_addr_des:
+            if config_ipv6 == "yes" and ipv6_addr_des and not server_cn:
                 target_ip = "[%s]" % ipv6_addr_des
-            elif config_ipv6 != "yes" and server_cn:
+            elif server_cn:
                 target_ip = server_cn
             elif config_ipv6 != "yes" and ipv6_addr_des:
                 target_ip = "[%s]" % ipv6_addr_des
@@ -1443,35 +1497,35 @@ def run(test, params, env):
                 remote_cpu_xml = get_cpu_xml_from_virsh_caps(runner)
                 session.close()
                 logging.debug("Remote CPU XML: \n%s", remote_cpu_xml)
-                cpu_xml = os.path.join(test.tmpdir, 'cpu.xml')
+                cpu_xml = os.path.join(data_dir.get_tmp_dir(), 'cpu.xml')
                 fp = open(cpu_xml, "w+")
                 fp.write(local_cpu_xml)
                 fp.write("\n")
                 fp.write(remote_cpu_xml)
                 fp.close()
-                cpu_xml_cxt = process.system_output("cat %s" % cpu_xml, shell=True)
+                cpu_xml_cxt = to_text(process.system_output("cat %s" % cpu_xml, shell=True))
                 logging.debug("The CPU XML contents: \n%s", cpu_xml_cxt)
                 cmd = "sed -i '/<vendor>.*<\/vendor>/d' %s" % cpu_xml
                 process.system(cmd, shell=True)
-                cpu_xml_cxt = process.system_output("cat %s" % cpu_xml, shell=True)
+                cpu_xml_cxt = to_text(process.system_output("cat %s" % cpu_xml, shell=True))
                 logging.debug("The current CPU XML contents: \n%s", cpu_xml_cxt)
                 output = compute_cpu_baseline(cpu_xml, status_error)
                 logging.debug("The baseline CPU XML: \n%s", output)
                 output = output.replace("\n", "")
-                vm_new_xml = os.path.join(test.tmpdir, 'vm_new.xml')
+                vm_new_xml = os.path.join(data_dir.get_tmp_dir(), 'vm_new.xml')
                 fp = open(vm_new_xml, "w+")
                 fp.write(str(vmxml_backup))
                 fp.close()
-                vm_new_xml_cxt = process.system_output("cat %s" % vm_new_xml, shell=True)
+                vm_new_xml_cxt = to_text(process.system_output("cat %s" % vm_new_xml, shell=True))
                 logging.debug("The current VM XML contents: \n%s", vm_new_xml_cxt)
                 cpuxml = output
                 cmd = 'sed -i "/<\/features>/ a\%s" %s' % (cpuxml, vm_new_xml)
                 logging.debug("The command: %s", cmd)
                 process.system(cmd, shell=True)
-                vm_new_xml_cxt = process.system_output("cat %s" % vm_new_xml, shell=True)
+                vm_new_xml_cxt = to_text(process.system_output("cat %s" % vm_new_xml, shell=True))
                 logging.debug("The new VM XML contents: \n%s", vm_new_xml_cxt)
                 virsh.define(vm_new_xml)
-                vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+                vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
                 logging.debug("The current VM XML contents: \n%s", vm_xml_cxt)
             finally:
                 logging.info("Recovery VM XML configration")
@@ -1489,7 +1543,7 @@ def run(test, params, env):
             update_cmd += vcpu_args + ">" + vcpu_num + r"<\/vcpu>"
             edit_cmd.append(update_cmd)
             libvirt.exec_virsh_edit(vm_name, edit_cmd)
-            vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+            vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
             logging.debug("The current VM XML contents: \n%s", vm_xml_cxt)
 
         # setup IPv6
@@ -1589,7 +1643,7 @@ def run(test, params, env):
         if mb_enable:
             logging.info("Add memoryBacking into VM XML")
             vm_xml.VMXML.set_memoryBacking_tag(vm_name)
-            vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+            vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
             logging.debug("The current VM XML: \n%s", vm_xml_cxt)
 
         if config_remote_hugepages:
@@ -1607,7 +1661,7 @@ def run(test, params, env):
 
         if create_disk_src_backing_file:
             cmd = create_disk_src_backing_file + orig_image_name
-            out = process.system_output(cmd, ignore_status=True, shell=True)
+            out = to_text(process.system_output(cmd, ignore_status=True, shell=True))
             if not out:
                 raise exceptions.TestFail("Failed to create backing file: %s"
                                           % cmd)
@@ -1632,7 +1686,7 @@ def run(test, params, env):
 
         if memtune_options:
             virsh.memtune_set(vm_name, memtune_options)
-            vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+            vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
             logging.debug("The VM XML with memory tune: \n%s", vm_xml_cxt)
 
         # Update disk driver with iothread attribute.
@@ -1680,8 +1734,9 @@ def run(test, params, env):
                                         flagstr="--config", **virsh_dargs)
                     process.run("rm -f %s" % disk_xml, ignore_status=True, shell=True)
 
-                vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+                vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
                 logging.debug("The VM XML with attached disk: \n%s", vm_xml_cxt)
+                source_file = None
 
         if local_image and not os.path.exists(local_image):
             image_fmt = test_dict.get("local_image_format", "raw")
@@ -1713,7 +1768,7 @@ def run(test, params, env):
                 if c_attach.exit_status != 0:
                     logging.error("Attach disk failed before test.")
 
-                vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+                vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
                 logging.debug("The VM XML with attached disk: \n%s", vm_xml_cxt)
 
                 attach_disk = True
@@ -1728,7 +1783,7 @@ def run(test, params, env):
             result = None
             try:
                 vm.start()
-            except virt_vm.VMStartError, e:
+            except virt_vm.VMStartError as e:
                 logging.info("Recovery VM XML configration")
                 vmxml_backup.sync()
                 logging.debug("The current VM XML:\n%s", vmxml_backup.xmltreefile)
@@ -1761,20 +1816,26 @@ def run(test, params, env):
             if (utils_misc.is_qemu_capability_supported("drive-mirror") and
                     utils_misc.is_qemu_capability_supported("nbd-server")):
                 support_precreation = True
-        except exceptions.TestError, e:
+        except exceptions.TestError as e:
             logging.debug(e)
 
         test_dict["support_precreation"] = support_precreation
         if create_target_image:
             if support_precreation and no_create_pool == "no":
                 create_target_pool = True
-        if create_target_pool:
+        if target_pool_name and create_target_pool:
             create_target_image = False
             pool_created = create_destroy_pool_on_remote("create", test_dict)
             if not pool_created:
                 raise exceptions.TestError("Create pool on remote host '%s' "
                                            "failed." % server_ip)
             remote_image_list.append(target_image_source)
+        elif target_pool_name and not create_target_pool:
+            pool_destroyed = destroy_active_pool_on_remote(test_dict)
+            if not pool_destroyed:
+                raise test.error("Destroy pool on remote host '%s' failed"
+                                 % server_ip)
+
         if create_target_image:
             if not target_image_size and image_info_dict:
                 target_image_size = image_info_dict.get('vsize')
@@ -1822,6 +1883,8 @@ def run(test, params, env):
             libvirt.create_local_disk("file", path=attach_B_disk_source, size="0.1",
                                       disk_format="qcow2")
             test_dict["driver_type"] = "qcow2"
+            driver_cache = test_dict.get("disk_driver_cache", "none")
+            test_dict["driver_cache"] = driver_cache
             libvirt.attach_additional_device(vm.name, attach_A_disk_target,
                                              attach_A_disk_source, test_dict,
                                              config=False)
@@ -1903,7 +1966,7 @@ def run(test, params, env):
                                           % (run_cmd_in_vm, output))
             logging.debug(output)
 
-        if stress_args:
+        if enable_stress_test and stress_args and stress_type:
             s_list = stress_type.split("_")
 
             if s_list and s_list[-1] == "vms":
@@ -1922,10 +1985,9 @@ def run(test, params, env):
             elif s_list and s_list[-1] == "host":
                 logging.info("Run '%s %s' in %s", s_list[0],
                              stress_args, s_list[-1])
-                pkg_list = ['stress']
-                libvirt.yum_install(pkg_list)
+                test_dict['stress_package'] = 'stress'
                 err_msg = utils_test.load_stress(stress_type,
-                                                 [vm], test_dict)
+                                                 test_dict, [vm])
                 if len(err_msg):
                     raise exceptions.TestFail("Add stress for migration failed:%s"
                                               % err_msg[0])
@@ -1941,6 +2003,18 @@ def run(test, params, env):
 
         netperf_version = test_dict.get("netperf_version")
         if netperf_version:
+            # Install tar on client
+            # Note: tar is used to untar netperf package later.
+            if not utils_package.package_install(["tar"]):
+                test.error("Failed to install tar on client")
+
+            # Install tar on server
+            # Note: tar is used to untar netperf package later.
+            remote_session = remote.wait_for_login('ssh', server_ip, '22', server_user,
+                                                   server_pwd, r"[\#\$]\s*$")
+            if not utils_package.package_install(["tar"], remote_session):
+                test.error("Failed to install tar on server")
+
             ret, n_client_c, n_server_c = setup_netsever_and_launch_netperf(test_dict)
             if not ret:
                 raise exceptions.TestError("Can not start netperf on %s"
@@ -1992,7 +2066,7 @@ def run(test, params, env):
                         logging.error("Command output %s" %
                                       ret.stdout.strip())
                         raise exceptions.TestFail("Failed to attach-interface")
-            vm_xml_cxt = process.system_output("virsh dumpxml %s" % vm_name, shell=True)
+            vm_xml_cxt = to_text(process.system_output("virsh dumpxml %s" % vm_name, shell=True))
             logging.debug("The VM XML with attached interface: \n%s",
                           vm_xml_cxt)
 
@@ -2030,7 +2104,7 @@ def run(test, params, env):
         if run_migr_back:
             command = "virsh migrate %s %s %s" % (vm_name, virsh_options, uri)
             logging.debug("Start migrating: %s", command)
-            p = Popen(command, shell=True, stdout=PIPE, stderr=PIPE)
+            p = Popen(command, shell=True, universal_newlines=True, stdout=PIPE, stderr=PIPE)
 
             # wait for live storage migration starting
             time.sleep(delay)
@@ -2041,6 +2115,7 @@ def run(test, params, env):
                     if utils_misc.safe_kill(p.pid, signal.SIGINT):
                         logging.info("Succeed to cancel migration:"
                                      " [%s].", p.pid)
+                        time.sleep(delay)
                     else:
                         raise exceptions.TestError("Fail to cancel"
                                                    " migration: [%s]", p.pid)
@@ -2111,7 +2186,7 @@ def run(test, params, env):
                 else:
                     stderr = p.communicate()[1]
                     logging.debug(stderr)
-                    err_str = ".*error.*migration job: canceled by client"
+                    err_str = ".*error.*migration.*job: canceled by client"
                     if not re.search(err_str, stderr):
                         raise exceptions.TestFail("Can't find error: %s."
                                                   % (err_str))
@@ -2148,6 +2223,11 @@ def run(test, params, env):
                     p.kill()
                 except OSError:
                     pass
+
+        if (transport in ('tcp', 'tls') and uri_port) or disk_port:
+            port = disk_port if disk_port else uri_port[1:]
+            migrate_setup.migrate_pre_setup("//%s/" % server_ip, test_dict,
+                                            cleanup=False, ports=port)
 
         # Case for --disk_ports option.
         # Start the storage migration on a thread
@@ -2228,7 +2308,7 @@ def run(test, params, env):
                 cmd = "virsh dumpxml %s > %s" % (target_vm_name, xml_path)
                 status, output = run_remote_cmd(cmd, server_ip,
                                                 server_user, server_pwd)
-
+                logging.debug("Remote guest original xml:\n%s\n", output)
                 # Update the disk image to nfs shared storage on remote guest
                 logging.debug("Create a remote file")
                 guest_config = remote.RemoteFile(address=server_ip,
@@ -2237,11 +2317,21 @@ def run(test, params, env):
                                                  password=server_pwd,
                                                  port='22',
                                                  remote_path=xml_path)
-                pattern2repl = {r".*.qcow2.*":
+                logging.debug("Modify remote guest xml's disk path")
+                pattern2repl = {r"<source file=.*":
                                 "<source file='%s/%s'/>"
                                 % (nfs_mount_dir, image_name)}
+                guest_config.sub(pattern2repl)
 
-                logging.debug("Modify the config file using pattern")
+                logging.debug("Modify remote guest xml's machine type")
+                machine_type = "pc"
+                arch = platform.machine()
+                if arch.count("ppc64"):
+                    machine_type = "pseries"
+
+                pattern2repl = {r".*.machine=.*":
+                                "<type arch='%s' machine='%s'>hvm</type>"
+                                % (arch, machine_type)}
                 guest_config.sub(pattern2repl)
 
                 # undefine remote guest
@@ -2251,28 +2341,44 @@ def run(test, params, env):
                 # redefine remote guest using updated XML
                 logging.debug("Redefine remote guest")
                 result = remote_virsh_session.define(xml_path)
-                logging.debug(result.stdout)
+                logging.debug(result.stdout.strip())
 
                 # start remote guest
                 logging.debug("Start remote guest")
                 remote_virsh_session.start(target_vm_name)
 
+                # dumpxml remote guest
+                logging.debug("Remote guest XML:\n%s\n",
+                              remote_virsh_session.dumpxml(target_vm_name).stdout.strip())
+
                 # Permit iptables to permit special port to libvirt for
                 # migration on local machine
-                migrate_setup.migrate_pre_setup(src_uri, params, ports=uri_port)
+                migrate_setup.migrate_pre_setup(src_uri, params, ports=uri_port[1:])
 
-            except (process.CmdError, remote.SCPError), e:
+            except (process.CmdError, remote.SCPError) as e:
                 logging.debug(e)
-
+            except Exception as details:
+                logging.debug(details)
             finally:
-                logging.debug("Recover remote guest's XML")
                 del guest_config
                 remote_virsh_session.close_session()
 
             uri = "%s%s%s://%s:%s%s" % (driver, plus, transport,
-                                        client_cn, uri_port, uri_path)
+                                        client_cn, uri_port[1:], uri_path)
             test_dict["desuri"] = uri
             test_dict["vm_name_to_migrate"] = target_vm_name
+
+        # There is a migration different result from libvirt 4.3.0-1 when
+        # migrating without shared storage and --copy-storage-all
+        # Before: migration succeeds with image preallocation on target host
+        # After: migration is forbidden
+        err_msg = test_dict.get('err_msg', None)
+        if (err_msg and
+                "Migration without shared storage is unsafe" in err_msg and
+                not libvirt_version.version_compare(4, 3, 1)):
+            test_dict['status_error'] = 'no'
+            status_error = "no"
+            test_dict['err_msg'] = None
 
         if run_migr_front:
             migrate_vm(test_dict)
@@ -2317,13 +2423,15 @@ def run(test, params, env):
                                               "is not running."
                                               % target_vm_name)
 
-            except (remote.LoginError, aexpect.ShellError), detail:
+            except (remote.LoginError, aexpect.ShellError) as detail:
                 raise exceptions.TestError(detail)
-            except (process.CmdError, remote.SCPError), detail:
+            except (process.CmdError, remote.SCPError) as detail:
                 raise exceptions.TestError(detail)
             finally:
-                session.close()
-                remote_session.close_session()
+                if session:
+                    session.close()
+                if remote_session:
+                    remote_session.close_session()
 
         set_tgt_pm_suspend_tgt = test_dict.get("set_tgt_pm_suspend_target")
         set_tgt_pm_wakeup = "yes" == test_dict.get("set_tgt_pm_wakeup", "no")
@@ -2423,7 +2531,7 @@ def run(test, params, env):
         grep_str_local = test_dict.get("grep_str_from_local_libvirt_log")
         if config_libvirtd == "yes" and grep_str_local:
             cmd = "grep -E '%s' %s" % (grep_str_local, log_file)
-            logging.debug("Execute command %s: %s", cmd, process.system_output(cmd, shell=True))
+            logging.debug("Execute command %s: %s", cmd, to_text(process.system_output(cmd, shell=True)))
 
         grep_str_remote = test_dict.get("grep_str_from_remote_libvirt_log")
         if grep_str_remote:
@@ -2484,7 +2592,7 @@ def run(test, params, env):
                                               virsh_options, src_uri)
             logging.debug("Start migrating: %s", cmd)
             status, output = run_remote_cmd(cmd, server_ip, server_user,
-                                            server_pwd)
+                                            server_pwd, timeout=300)
             logging.info(output)
 
             if status:
@@ -2497,10 +2605,6 @@ def run(test, params, env):
     finally:
         logging.info("Recovery test environment")
         # Clean up of pre migration setup for local machine
-        if target_vm_name:
-            migrate_setup.migrate_pre_setup(src_uri, params,
-                                            cleanup=True,
-                                            ports=uri_port)
         if migr_vm_back:
             migrate_setup.migrate_pre_setup(src_uri, params,
                                             cleanup=True)
@@ -2611,9 +2715,15 @@ def run(test, params, env):
             # destroy guest on target machine
             remote_virsh_session = None
             try:
+                migrate_setup.migrate_pre_setup(src_uri, params,
+                                                cleanup=True,
+                                                ports=uri_port[1:])
                 remote_virsh_session = virsh.VirshPersistent(**remote_virsh_dargs)
+                logging.debug("Destroy remote guest")
                 remote_virsh_session.destroy(target_vm_name)
-            except (process.CmdError, remote.SCPError), detail:
+                logging.debug("Recover remote guest xml")
+                remote_virsh_session.define(xml_path)
+            except (process.CmdError, remote.SCPError) as detail:
                 raise exceptions.TestError(detail)
             finally:
                 remote_virsh_session.close_session()
@@ -2645,7 +2755,7 @@ def run(test, params, env):
         # And migrated vms may be not login if the network is local lan
         if stress_type == "stress_on_host":
             logging.info("Unload stress from host")
-            utils_test.unload_stress(stress_type, [vm])
+            utils_test.unload_stress(stress_type, params=test_dict, vms=[vm])
 
         if HUGETLBFS_MOUNT:
             cmds = ["umount -l %s" % remote_hugetlbfs_path,
@@ -2685,4 +2795,10 @@ def run(test, params, env):
         if n_client_s:
             n_client_s.package.env_cleanup(True)
 
-        cleanup(objs_list)
+        if objs_list and len(objs_list) > 0:
+            logging.debug("Clean up the objects")
+            cleanup(objs_list)
+        if (transport in ('tcp', 'tls') and uri_port) or disk_port:
+            port = disk_port if disk_port else uri_port[1:]
+            migrate_setup.migrate_pre_setup("//%s/" % server_ip, test_dict,
+                                            cleanup=True, ports=port)

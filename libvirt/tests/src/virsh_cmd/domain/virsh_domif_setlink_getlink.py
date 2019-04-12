@@ -4,9 +4,8 @@ import re
 import uuid
 import aexpect
 
-from autotest.client.shared import error
-
 from virttest import virsh
+from virttest import data_dir
 from virttest import utils_net
 from virttest import utils_misc
 from virttest.libvirt_xml import vm_xml
@@ -58,7 +57,7 @@ def run(test, params, env):
             logging.info("exit: %s, output: %s",
                          cmd_status, output)
             return re.search(pattern, output)
-        except (aexpect.ShellTimeoutError, aexpect.ShellStatusError), e:
+        except (aexpect.ShellTimeoutError, aexpect.ShellStatusError) as e:
             logging.debug(e)
             return re.search(pattern, str(e.__str__))
 
@@ -133,7 +132,7 @@ def run(test, params, env):
     password = params.get("password")
 
     # Back up xml file.
-    vm_xml_file = os.path.join(test.tmpdir, "vm.xml")
+    vm_xml_file = os.path.join(data_dir.get_tmp_dir(), "vm.xml")
     virsh.dumpxml(vm_name[0], extra="--inactive", to_file=vm_xml_file)
 
     # Vm status
@@ -194,12 +193,12 @@ def run(test, params, env):
         # Check the getlink command output
         if status_error == "no":
             if not re.search(if_operation, getlink_output):
-                raise error.TestFail("Getlink result should "
-                                     "equal with setlink operation")
+                test.fail("Getlink result should "
+                          "equal with setlink operation")
 
         logging.info("Getlink done")
-        # If --config is given should restart the vm then test link status
-        if options == "--config" and vm.is_alive():
+        # If --config or --persistent is given should restart the vm then test link status
+        if any(options == option for option in ["--config", "--persistent"]) and vm.is_alive():
             vm.destroy()
             vm.start()
             logging.info("Restart VM")
@@ -236,14 +235,16 @@ def run(test, params, env):
                 error_msg = "Link state isn't up in guest"
 
             # Ignore status of this one
-            cmd = 'ifdown %s' % guest_if_name
-            pattern = "Device '%s' successfully disconnected" % guest_if_name
-            guest_cmd_check(cmd, session, pattern)
+            cmd = 'ip link set down %s' % guest_if_name
+            session.cmd_status_output(cmd, timeout=10)
+            pattern = "%s:.*state DOWN.*" % guest_if_name
+            pattern_cmd = 'ip addr show dev %s' % guest_if_name
+            guest_cmd_check(pattern_cmd, session, pattern)
 
-            cmd = 'ifup %s' % guest_if_name
-            pattern = "Determining IP information for %s" % guest_if_name
-            pattern += "|Connection successfully activated"
-            if not guest_cmd_check(cmd, session, pattern):
+            cmd = 'ip link set up %s' % guest_if_name
+            session.cmd_status_output(cmd, timeout=10)
+            pattern = "%s:.*state UP.*" % guest_if_name
+            if not guest_cmd_check(pattern_cmd, session, pattern):
                 error_msg = ("Could not bring up interface %s inside guest"
                              % guest_if_name)
         else:  # negative test
@@ -251,7 +252,7 @@ def run(test, params, env):
             vm.destroy()
 
         if error_msg:
-            raise error.TestFail(error_msg)
+            test.fail(error_msg)
 
         # Check status_error
         if status_error == "yes":
@@ -260,11 +261,11 @@ def run(test, params, env):
                              result.stderr.strip())
 
             else:
-                raise error.TestFail("Unexpected return code %d "
-                                     "(negative testing)" % status)
+                test.fail("Unexpected return code %d "
+                          "(negative testing)" % status)
         elif status_error != "no":
-            raise error.TestError("Invalid value for status_error '%s' "
-                                  "(must be 'yes' or 'no')" % status_error)
+            test.error("Invalid value for status_error '%s' "
+                       "(must be 'yes' or 'no')" % status_error)
     finally:
         # Recover VM.
         if vm.is_alive():

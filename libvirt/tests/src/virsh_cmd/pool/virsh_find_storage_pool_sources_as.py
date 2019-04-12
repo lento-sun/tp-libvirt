@@ -6,6 +6,7 @@ from avocado.core import exceptions
 from virttest import virsh
 from virttest import utils_test
 from virttest.staging import lv_utils
+from virttest.compat_52lts import decode_to_text as to_text
 
 
 def run(test, params, env):
@@ -52,7 +53,7 @@ def run(test, params, env):
                     # Create VG by using iscsi device
                     lv_utils.vg_create(vg_name, iscsi_device)
                     cleanup_logical = True
-            except Exception, detail:
+            except Exception as detail:
                 if cleanup_iscsi:
                     utils_test.libvirt.setup_or_cleanup_iscsi(False)
                 raise exceptions.TestFail("iscsi setup failed:\n%s" % detail)
@@ -73,7 +74,7 @@ def run(test, params, env):
         # Clean up
         if cleanup_logical:
             cmd = "pvs |grep %s |awk '{print $1}'" % vg_name
-            pv_name = process.system_output(cmd, shell=True)
+            pv_name = to_text(process.system_output(cmd, shell=True))
             lv_utils.vg_remove(vg_name)
             process.run("pvremove %s" % pv_name)
         if cleanup_iscsi:

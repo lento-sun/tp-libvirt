@@ -1,7 +1,9 @@
 import logging
 import os
+import platform
 
 from virttest import virt_vm
+from virttest import data_dir
 from virttest import virsh
 from virttest import utils_libvirtd
 from virttest import utils_misc
@@ -34,6 +36,8 @@ def run(test, params, env):
     pmsuspend_error = 'yes' == params.get("pmsuspend_error", 'no')
     pmsuspend_error_msg = params.get("pmsuspend_error_msg")
     agent_error_test = 'yes' == params.get("agent_error_test", 'no')
+    arch = platform.processor()
+    duration_value = int(params.get("duration", "0"))
 
     # Libvirt acl test related params
     uri = params.get("virsh_uri")
@@ -63,11 +67,12 @@ def run(test, params, env):
         if pmsuspend_error:
             fail_pat.append('access denied')
 
-    # Setup possible failure patterns
-    if pm_enabled == 'not_set':
-        fail_pat.append('not supported')
-    if pm_enabled == 'no':
-        fail_pat.append('disabled')
+    # Setup possible failure patterns excluding ppc
+    if "ppc64" not in arch:
+        if pm_enabled == 'not_set':
+            fail_pat.append('not supported')
+        if pm_enabled == 'no':
+            fail_pat.append('disabled')
 
     if vm_state == 'paused':
         # For older version
@@ -90,22 +95,23 @@ def run(test, params, env):
             vm.destroy()
 
         # Set pm tag in domain's XML if needed.
-        if pm_enabled == 'not_set':
-            try:
-                if vmxml.pm:
-                    del vmxml.pm
-            except xcepts.LibvirtXMLNotFoundError:
-                pass
-        else:
-            pm_xml = vm_xml.VMPMXML()
-            pm_xml.mem_enabled = pm_enabled_mem
-            pm_xml.disk_enabled = pm_enabled_disk
-            vmxml.pm = pm_xml
-        vmxml.sync()
+        if "ppc64" not in arch:
+            if pm_enabled == 'not_set':
+                try:
+                    if vmxml.pm:
+                        del vmxml.pm
+                except xcepts.LibvirtXMLNotFoundError:
+                    pass
+            else:
+                pm_xml = vm_xml.VMPMXML()
+                pm_xml.mem_enabled = pm_enabled_mem
+                pm_xml.disk_enabled = pm_enabled_disk
+                vmxml.pm = pm_xml
+            vmxml.sync()
 
         try:
             vm.prepare_guest_agent()
-        except virt_vm.VMStartError, info:
+        except virt_vm.VMStartError as info:
             if "not supported" in str(info).lower():
                 test.cancel(info)
             else:
@@ -123,7 +129,7 @@ def run(test, params, env):
 
         try:
             libvirtd = utils_libvirtd.Libvirtd()
-            savefile = os.path.join(test.tmpdir, "%s.save" % vm_name)
+            savefile = os.path.join(data_dir.get_tmp_dir(), "%s.save" % vm_name)
             session = vm.wait_for_login()
             # Touch a file on guest to test managed save command.
             if test_managedsave:
@@ -137,24 +143,31 @@ def run(test, params, env):
                 vm.destroy()
 
             # Run test case
-            result = virsh.dompmsuspend(vm_name, suspend_target, debug=True,
+            result = virsh.dompmsuspend(vm_name, suspend_target, duration=duration_value, debug=True,
                                         uri=uri,
                                         unprivileged_user=unprivileged_user)
             if result.exit_status == 0:
                 if fail_pat:
                     test.fail("Expected failed with %s, but run succeed:\n%s" %
-                              (fail_pat, result))
+                              (fail_pat, result.stdout))
             else:
                 if unsupported_guest_err in result.stderr:
-                    fail_pat.append(unsupported_guest_err)
+                    test.cancel("Unsupported suspend mode:\n%s" % result.stderr)
                 if not fail_pat:
-                    test.fail("Expected success, but run failed:\n%s" % result)
+                    test.fail("Expected success, but run failed:\n%s" % result.stderr)
                 #if not any_pattern_match(fail_pat, result.stderr):
                 if not any(p in result.stderr for p in fail_pat):
                     test.fail("Expected failed with one of %s, but "
-                              "failed with:\n%s" % (fail_pat, result))
+                              "failed with:\n%s" % (fail_pat, result.stderr))
 
-            utils_misc.wait_for(lambda: vm.state() == 'pmsuspended', 30)
+            # If pmsuspend_error is True, just skip below checking, and return directly.
+            if pmsuspend_error:
+                return
+            # check whether the state changes to pmsuspended
+            if not utils_misc.wait_for(lambda: vm.state() == 'pmsuspended', 30):
+                test.fail("VM failed to change its state, expected state: "
+                          "pmsuspended, but actual state: %s" % vm.state())
+
             if agent_error_test:
                 ret = virsh.dompmsuspend(vm_name, "mem", **virsh_dargs)
                 libvirt.check_result(ret, fail_pat)

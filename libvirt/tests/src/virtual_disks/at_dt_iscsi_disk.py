@@ -4,14 +4,14 @@ import time
 import base64
 import logging
 import platform
+import locale
 
 from aexpect import ShellError
-
-from autotest.client.shared import error
 
 from avocado.utils import process
 
 from virttest import virsh
+from virttest import data_dir
 from virttest import utils_misc
 from virttest.remote import LoginError
 from virttest.virt_vm import VMError
@@ -65,17 +65,26 @@ def run(test, params, env):
 
     if disk_src_protocol == 'iscsi':
         if not libvirt_version.version_compare(1, 0, 4):
-            raise error.TestNAError("'iscsi' disk doesn't support in"
-                                    " current libvirt version.")
+            test.cancel("'iscsi' disk doesn't support in"
+                        " current libvirt version.")
     if disk_type == "volume":
         if not libvirt_version.version_compare(1, 0, 5):
-            raise error.TestNAError("'volume' type disk doesn't support in"
-                                    " current libvirt version.")
+            test.cancel("'volume' type disk doesn't support in"
+                        " current libvirt version.")
     # Back VM XML
     vmxml_backup = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
 
     virsh_dargs = {'debug': True, 'ignore_status': True}
     try:
+        start_vm = "yes" == params.get("start_vm", "yes")
+        if start_vm:
+            if vm.is_dead():
+                vm.start()
+            vm.wait_for_login()
+        else:
+            if not vm.is_dead():
+                vm.destroy()
+
         if chap_auth:
             # Create a secret xml to define it
             secret_xml = SecretXML(secret_ephemeral, secret_private)
@@ -83,7 +92,8 @@ def run(test, params, env):
             secret_xml.auth_username = chap_user
             secret_xml.usage = disk_src_protocol
             secret_xml.target = secret_usage_target
-            logging.debug("Define secret by XML: %s", open(secret_xml.xml).read())
+            with open(secret_xml.xml) as f:
+                logging.debug("Define secret by XML: %s", f.read())
             # Define secret
             cmd_result = virsh.secret_define(secret_xml.xml, **virsh_dargs)
             libvirt.check_exit_status(cmd_result)
@@ -91,10 +101,11 @@ def run(test, params, env):
             try:
                 secret_uuid = cmd_result.stdout.strip().split()[1]
             except IndexError:
-                raise error.TestError("Fail to get new created secret uuid")
+                test.error("Fail to get new created secret uuid")
 
             # Set secret value
-            secret_string = base64.b64encode(chap_passwd)
+            encoding = locale.getpreferredencoding()
+            secret_string = base64.b64encode(chap_passwd.encode(encoding)).decode(encoding)
             cmd_result = virsh.secret_set_value(secret_uuid, secret_string,
                                                 **virsh_dargs)
             libvirt.check_exit_status(cmd_result)
@@ -134,8 +145,8 @@ def run(test, params, env):
                 cmd_result = virsh.vol_list(disk_src_pool, **virsh_dargs)
                 libvirt.check_exit_status(cmd_result)
                 vol_list = []
-                vol_list = re.findall(r"(\S+)\ +(\S+)[\ +\n]",
-                                      str(cmd_result.stdout))
+                vol_list = re.findall(r"(\S+)\ +(\S+)",
+                                      str(cmd_result.stdout.strip()))
                 if len(vol_list) > 1:
                     return vol_list[1]
                 else:
@@ -146,7 +157,7 @@ def run(test, params, env):
             if vol_info:
                 vol_name, vol_path = vol_info
             else:
-                raise error.TestError("Failed to get volume info")
+                test.error("Failed to get volume info")
             # Snapshot doesn't support raw disk format, create a qcow2 volume
             # disk for snapshot operation.
             process.run('qemu-img create -f qcow2 %s %s' % (vol_path, '100M'),
@@ -170,7 +181,7 @@ def run(test, params, env):
                                'driver_type': 'qcow2',
                                'source_mode': disk_src_mode}
         else:
-            error.TestNAError("Unsupport disk type in this test")
+            test.cancel("Unsupport disk type in this test")
         disk_params.update(disk_params_src)
         if chap_auth:
             disk_params_auth = {'auth_user': chap_user,
@@ -178,20 +189,7 @@ def run(test, params, env):
                                 'secret_usage': secret_xml.target}
             disk_params.update(disk_params_auth)
         disk_xml = libvirt.create_disk_xml(disk_params)
-
-        start_vm = "yes" == params.get("start_vm", "yes")
-        if start_vm:
-            if vm.is_dead():
-                vm.start()
-            vm.wait_for_login()
-        else:
-            if not vm.is_dead():
-                vm.destroy()
         attach_option = params.get("attach_option", "")
-        disk_xml_f = open(disk_xml)
-        disk_xml_content = disk_xml_f.read()
-        disk_xml_f.close()
-        logging.debug("Attach disk by XML: %s", disk_xml_content)
         cmd_result = virsh.attach_device(domainarg=vm_name, filearg=disk_xml,
                                          flagstr=attach_option,
                                          dargs=virsh_dargs)
@@ -205,7 +203,7 @@ def run(test, params, env):
         vm.wait_for_login().close()
         domain_operation = params.get("domain_operation", "")
         if domain_operation == "save":
-            save_file = os.path.join(test.tmpdir, "vm.save")
+            save_file = os.path.join(data_dir.get_tmp_dir(), "vm.save")
             cmd_result = virsh.save(vm_name, save_file, **virsh_dargs)
             libvirt.check_exit_status(cmd_result)
             cmd_result = virsh.restore(save_file)
@@ -224,12 +222,12 @@ def run(test, params, env):
             try:
                 virsh.snapshot_list(vm_name, **virsh_dargs)
             except process.CmdError:
-                error.TestFail("Failed getting snapshots list for %s" % vm_name)
+                test.fail("Failed getting snapshots list for %s" % vm_name)
 
             try:
                 virsh.snapshot_info(vm_name, snapshot_name1, **virsh_dargs)
             except process.CmdError:
-                error.TestFail("Failed getting snapshots info for %s" % vm_name)
+                test.fail("Failed getting snapshots info for %s" % vm_name)
 
             cmd_result = virsh.snapshot_dumpxml(vm_name, snapshot_name1,
                                                 **virsh_dargs)
@@ -241,7 +239,7 @@ def run(test, params, env):
             cmd_result = virsh.snapshot_current(vm_name, **virsh_dargs)
             libvirt.check_exit_status(cmd_result)
 
-            snapshot_file = os.path.join(test.tmpdir, snapshot_name2)
+            snapshot_file = os.path.join(data_dir.get_tmp_dir(), snapshot_name2)
             sn_create_op = ("%s --disk-only --diskspec %s,file=%s"
                             % (snapshot_name2, disk_target, snapshot_file))
             cmd_result = virsh.snapshot_create_as(vm_name, sn_create_op,
@@ -253,8 +251,9 @@ def run(test, params, env):
 
             cmd_result = virsh.snapshot_list(vm_name, **virsh_dargs)
             if snapshot_name2 not in cmd_result:
-                raise error.TestError("Snapshot %s not found" % snapshot_name2)
-
+                test.error("Snapshot %s not found" % snapshot_name2)
+        elif domain_operation == "":
+            logging.debug("No domain operation provided, so skip it")
         else:
             logging.error("Unsupport operation %s in this case, so skip it",
                           domain_operation)
@@ -265,7 +264,7 @@ def run(test, params, env):
             """
             found_disk = False
             if vm.is_dead():
-                raise error.TestError("Domain %s is not running" % vm_name)
+                test.error("Domain %s is not running" % vm_name)
             else:
                 try:
                     session = vm.wait_for_login()
@@ -279,12 +278,12 @@ def run(test, params, env):
                     session.close()
                     if s == 0:
                         found_disk = True
-                except (LoginError, VMError, ShellError), e:
+                except (LoginError, VMError, ShellError) as e:
                     logging.error(str(e))
             if found_disk == expect:
                 logging.debug("Check disk inside the VM PASS as expected")
             else:
-                raise error.TestError("Check disk inside the VM FAIL")
+                test.error("Check disk inside the VM FAIL")
 
         # Check disk inside the VM, expect is False if status_error=True
         find_attach_disk(not status_error)
@@ -298,10 +297,11 @@ def run(test, params, env):
 
     finally:
         # Clean up snapshot
-        libvirt.clean_up_snapshots(vm_name, domxml=vmxml_backup)
-        # Restore vm
+        # Shut down before cleaning up snapshots
         if vm.is_alive():
             vm.destroy()
+        libvirt.clean_up_snapshots(vm_name, domxml=vmxml_backup)
+        # Restore vm
         vmxml_backup.sync("--snapshots-metadata")
         # Destroy pool and undefine secret, which may not exist
         try:
@@ -309,6 +309,6 @@ def run(test, params, env):
                 virsh.pool_destroy(disk_src_pool)
             if chap_auth:
                 virsh.secret_undefine(secret_uuid)
-        except:
+        except Exception:
             pass
         libvirt.setup_or_cleanup_iscsi(is_setup=False)

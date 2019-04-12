@@ -51,7 +51,7 @@ def run(test, params, env):
 
     # Get host numa node list
     host_numa_node = utils_misc.NumaInfo()
-    node_list = host_numa_node.online_nodes
+    node_list = host_numa_node.online_nodes_withmem
     logging.debug("host node list is %s", node_list)
     if len(node_list) < 2:
         raise exceptions.TestSkipError("At least 2 numa nodes are needed on"
@@ -67,7 +67,8 @@ def run(test, params, env):
 
     # Prepare libvirtd session with log level as 1
     config_path = os.path.join(data_dir.get_tmp_dir(), "virt-test.conf")
-    open(config_path, 'a').close()
+    with open(config_path, 'a') as f:
+        pass
     config = utils_config.LibvirtdConfig(config_path)
     config.log_level = 1
     arg_str = "--config %s" % config_path
@@ -81,10 +82,17 @@ def run(test, params, env):
         # and start it as daemon to fix selinux denial
         try:
             path.find_command('virtlogd')
-            process.run("service virtlogd stop", ignore_status=True)
-            process.run("virtlogd -d")
+            process.run("service virtlogd stop", ignore_status=True, shell=True)
+            process.run("virtlogd -d", shell=True)
         except path.CmdNotFoundError:
             pass
+
+        # Allow for more times to libvirtd restarted sucessfully.
+        ret = utils_misc.wait_for(lambda: libvirtd.is_working(),
+                                  timeout=240,
+                                  step=1)
+        if not ret:
+            test.fail("Libvirtd hang after restarted")
 
         if numa_memory.get('nodeset'):
             used_node = utils_test.libvirt.cpus_parser(numa_memory['nodeset'])
@@ -102,7 +110,7 @@ def run(test, params, env):
         try:
             vm.start()
             vm.wait_for_login()
-        except virt_vm.VMStartError, e:
+        except virt_vm.VMStartError as e:
             raise exceptions.TestFail("Test failed in positive case.\n "
                                       "error: %s" % e)
 
@@ -146,16 +154,20 @@ def run(test, params, env):
             # If there are inconsistent node numbers on host,
             # convert it into sequence number so that it can be used
             # in mem_compare
-            left_node_new = [node_list.index(i) for i in node_list if i != node]
-            used_node = [node_list.index(node)]
+            # memory_status is a total numa list. node_list could not
+            # match the count of nodes
+            total_online_node_list = host_numa_node.online_nodes
+            left_node_new = [total_online_node_list.index(i)
+                             for i in total_online_node_list if i != node]
+            used_node = [total_online_node_list.index(node)]
 
             mem_compare(used_node, left_node_new)
 
     finally:
         try:
             path.find_command('virtlogd')
-            process.run('pkill virtlogd', ignore_status=True)
-            process.run('systemctl restart virtlogd.socket', ignore_status=True)
+            process.run('pkill virtlogd', ignore_status=True, shell=True)
+            process.run('systemctl restart virtlogd.socket', ignore_status=True, shell=True)
         except path.CmdNotFoundError:
             pass
         libvirtd.exit()

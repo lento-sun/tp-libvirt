@@ -3,7 +3,7 @@ import os
 import logging
 import time
 
-from autotest.client.shared import error
+from functools import reduce
 
 from virttest import virsh
 from virttest import utils_libvirtd
@@ -13,7 +13,7 @@ from virttest.utils_test import libvirt
 from virttest.libvirt_xml import vm_xml
 
 
-def manipulate_domain(vm_name, action, recover=False):
+def manipulate_domain(test, vm_name, action, recover=False):
     """
     Save/managedsave/S3/S4 domain or recover it.
     """
@@ -52,7 +52,7 @@ def manipulate_domain(vm_name, action, recover=False):
                 libvirt.check_exit_status(result)
                 os.remove(save_file)
             else:
-                raise error.TestError("No save file for domain restore")
+                test.error("No save file for domain restore")
         elif action in ["managedsave", "s4"]:
             result = virsh.start(vm_name, ignore_status=True, debug=True)
             libvirt.check_exit_status(result)
@@ -76,7 +76,7 @@ def run(test, params, env):
     4) Check result.
     """
 
-    def vm_usable_mem(session):
+    def get_vm_usable_mem(session):
         """
         Get total usable RAM from /proc/meminfo
         """
@@ -95,7 +95,7 @@ def run(test, params, env):
         dmi_mem = session.cmd_output(cmd)
         total_physical_mem = reduce(lambda x, y: int(x) + int(y),
                                     re.findall(r'Size:\s(\d+)\sMB', dmi_mem))
-        return int(total_physical_mem) * 1024 - vm_usable_mem(session)
+        return int(total_physical_mem) * 1024 - get_vm_usable_mem(session)
 
     def make_domref(domarg, vm_ref, domid, vm_name, domuuid):
         """
@@ -133,7 +133,7 @@ def run(test, params, env):
             size_darg_key = "size"
 
         if mem_ref == "halfless":
-            size_darg_value = "%d" % (original_mem / 2)
+            size_darg_value = "%d" % (original_mem // 2)
         elif mem_ref == "halfmore":
             size_darg_value = "%d" % int(original_mem * 1.5)  # no fraction
         elif mem_ref == "same":
@@ -214,7 +214,7 @@ def run(test, params, env):
     quiesce_delay = int(params.get("setmem_quiesce_delay", "1"))
     domarg = params.get("setmem_domarg", "no")
     sizearg = params.get("setmem_sizearg", "no")
-    libvirt = params.get("libvirt", "on")
+    libvirt_status = params.get("libvirt", "on")
     delta_percentage = float(params.get("setmem_delta_per", "10"))
     start_vm = "yes" == params.get("start_vm", "yes")
     vm_name = params.get("main_vm", "avocado-vt-vm1")
@@ -224,6 +224,8 @@ def run(test, params, env):
     manipulate_dom_after_setmem = "yes" == params.get(
         "manipulate_dom_after_setmem", "no")
     manipulate_action = params.get("manipulate_action", "")
+    readonly = "yes" == params.get("setmem_readonly", "no")
+    expect_msg = params.get("setmem_err_msg")
 
     vm = env.get_vm(vm_name)
     # Back up domain XML
@@ -282,11 +284,11 @@ def run(test, params, env):
     if session.cmd_status('dmidecode'):
         # The physical memory size is in vm xml, use it when dmideode not
         # supported
-        unusable_mem = int(vmxml.max_mem) - vm_usable_mem(session)
+        unusable_mem = int(vmxml.max_mem) - get_vm_usable_mem(session)
     else:
         unusable_mem = vm_unusable_mem(session)
     original_outside_mem = vm.get_used_mem()
-    original_inside_mem = vm_usable_mem(session)
+    original_inside_mem = get_vm_usable_mem(session)
     session.close()
     # Prepare VM state
     if not start_vm:
@@ -305,13 +307,14 @@ def run(test, params, env):
     # Argument pattern is complex, build with dargs
     dargs = {'flagstr': flags,
              'use_kilobytes': use_kilobytes,
-             'uri': uri, 'ignore_status': True, "debug": True}
+             'uri': uri, 'ignore_status': True, "debug": True,
+             'readonly': readonly}
     dargs.update(make_domref(domarg, vm_ref, domid, vm_name, domuuid))
     dargs.update(make_sizeref(sizearg, mem_ref, original_outside_mem))
 
     # Prepare libvirtd status
     libvirtd = utils_libvirtd.Libvirtd()
-    if libvirt == "off":
+    if libvirt_status == "off":
         libvirtd.stop()
     else:
         if not libvirtd.is_running():
@@ -323,7 +326,7 @@ def run(test, params, env):
     try:
         memory_change = True
         if manipulate_dom_before_setmem:
-            manipulate_domain(vm_name, manipulate_action)
+            manipulate_domain(test, vm_name, manipulate_action)
             if manipulate_action in ['save', 'managedsave', 's4']:
                 memory_change = False
 
@@ -340,32 +343,17 @@ def run(test, params, env):
             time.sleep(quiesce_delay)
 
         if manipulate_dom_before_setmem:
-            manipulate_domain(vm_name, manipulate_action, True)
+            manipulate_domain(test, vm_name, manipulate_action, True)
         if manipulate_dom_after_setmem:
-            manipulate_domain(vm_name, manipulate_action)
-            manipulate_domain(vm_name, manipulate_action, True)
+            manipulate_domain(test, vm_name, manipulate_action)
+            manipulate_domain(test, vm_name, manipulate_action, True)
 
         # Recover libvirtd status
-        if libvirt == "off":
+        if libvirt_status == "off":
             libvirtd.start()
 
         # Gather stats if not running error test
         if not status_error and not old_libvirt_fail:
-            if not memory_change:
-                test_inside_mem = original_inside_mem
-                test_outside_mem = original_outside_mem
-            else:
-                if vm.state() == "shut off":
-                    vm.start()
-                # Make sure it's never paused
-                vm.resume()
-                session = vm.wait_for_login()
-
-                # Actual results
-                test_inside_mem = vm_usable_mem(session)
-                session.close()
-                test_outside_mem = vm.get_used_mem()
-
             # Expected results for both inside and outside
             if remove_balloon_driver:
                 expected_mem = original_outside_mem
@@ -384,37 +372,68 @@ def run(test, params, env):
                 expected_inside_mem = expected_mem
                 expected_outside_mem = original_outside_mem
 
+            def get_vm_mem():
+                """
+                Test results for both inside and outside
+                :return: Get vm memory for both inside and outside
+                """
+                if not memory_change:
+                    test_inside_mem = original_inside_mem
+                    test_outside_mem = original_outside_mem
+                else:
+                    if vm.state() == "shut off":
+                        vm.start()
+                    elif vm.state() == "paused":
+                        # Make sure it's never paused
+                        vm.resume()
+                    session = vm.wait_for_login()
+
+                    # Actual results
+                    test_inside_mem = get_vm_usable_mem(session)
+                    session.close()
+                    test_outside_mem = vm.get_used_mem()
+                return (test_inside_mem, test_outside_mem)
+
+            # Don't care about memory comparison on error test
+            def verify_outside_result():
+                _, test_outside_mem = get_vm_mem()
+                return(cal_deviation(test_outside_mem, expected_outside_mem) <= delta_percentage)
+
+            def verify_inside_result():
+                test_inside_mem, _ = get_vm_mem()
+                return(cal_deviation(test_inside_mem, expected_inside_mem) <= delta_percentage)
+
+            msg = "test conditions not met: "
+            error_flag = 0
+            if status is not 0:
+                error_flag = 1
+                msg += "Non-zero virsh setmem exit code. "
+            if not utils_misc.wait_for(verify_outside_result, timeout=240):
+                error_flag = 1
+                msg += "Outside memory deviated. "
+            if not utils_misc.wait_for(verify_inside_result, timeout=240):
+                error_flag = 1
+                msg += "Inside memory deviated. "
+
+            test_inside_mem, test_outside_mem = get_vm_mem()
             print_debug_stats(original_inside_mem, original_outside_mem,
                               test_inside_mem, test_outside_mem,
                               expected_outside_mem, expected_inside_mem,
                               delta_percentage, unusable_mem)
-
-            # Don't care about memory comparison on error test
-            outside_pass = cal_deviation(test_outside_mem,
-                                         expected_outside_mem) <= delta_percentage
-            inside_pass = cal_deviation(test_inside_mem,
-                                        expected_inside_mem) <= delta_percentage
-            if status is not 0 or not outside_pass or not inside_pass:
-                msg = "test conditions not met: "
-                if status is not 0:
-                    msg += "Non-zero virsh setmem exit code. "
-                if not outside_pass:
-                    msg += "Outside memory deviated. "
-                if not inside_pass:
-                    msg += "Inside memory deviated. "
-                raise error.TestFail(msg)
-
-            return  # Normal test passed
+            if error_flag:
+                test.fail(msg)
         elif not status_error and old_libvirt_fail:
             if status is 0:
                 if old_libvirt:
-                    raise error.TestFail("Error test did not result in an error")
+                    test.fail("Error test did not result in an error")
             else:
                 if not old_libvirt:
-                    raise error.TestFail("Newer libvirt failed when it should not")
+                    test.fail("Newer libvirt failed when it should not")
         else:  # Verify an error test resulted in error
             if status is 0:
-                raise error.TestFail("Error test did not result in an error")
+                test.fail("Error test did not result in an error")
+            if expect_msg:
+                libvirt.check_result(result, expect_msg.split(';'))
     finally:
         if need_mkswap:
             vm.cleanup_swap()

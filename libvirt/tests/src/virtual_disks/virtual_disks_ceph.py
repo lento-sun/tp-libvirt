@@ -2,21 +2,34 @@ import os
 import re
 import time
 import logging
+import shutil
 import aexpect
+
+from collections import OrderedDict
 
 from avocado.utils import process
 
 from virttest import virsh
+from virttest import utils_libvirtd
 from virttest import utils_misc
 from virttest import utils_package
 from virttest import virt_vm, remote
 from virttest import utils_libguestfs
 from virttest import libvirt_storage
+
+from virttest.utils_config import LibvirtQemuConfig
+from virttest.utils_config import LibvirtSanLockConfig
+
 from virttest.utils_test import libvirt
 from virttest.libvirt_xml import vm_xml
 from virttest.libvirt_xml import vol_xml
 from virttest.libvirt_xml import pool_xml
 from virttest.libvirt_xml import secret_xml
+from virttest.libvirt_xml.devices.lease import Lease
+from virttest import data_dir
+from virttest.compat_52lts import results_stdout_52lts
+
+from provider import libvirt_version
 
 
 def run(test, params, env):
@@ -32,6 +45,7 @@ def run(test, params, env):
     vm_name = params.get("main_vm")
     vm = env.get_vm(vm_name)
     virsh_dargs = {'debug': True, 'ignore_status': True}
+    additional_xml_file = os.path.join(data_dir.get_tmp_dir(), "additional_disk.xml")
 
     def config_ceph():
         """
@@ -148,22 +162,22 @@ def run(test, params, env):
         # vol-key
         ret = virsh.vol_key(vol_name, pool_name)
         libvirt.check_exit_status(ret)
-        if "%s/%s" % (disk_src_pool, vol_name) not in ret.stdout:
+        if "%s/%s" % (disk_src_pool, vol_name) not in ret.stdout.strip():
             test.fail("Volume key isn't correct")
         # vol-path
         ret = virsh.vol_path(vol_name, pool_name)
         libvirt.check_exit_status(ret)
-        if "%s/%s" % (disk_src_pool, vol_name) not in ret.stdout:
+        if "%s/%s" % (disk_src_pool, vol_name) not in ret.stdout.strip():
             test.fail("Volume path isn't correct")
         # vol-pool
         ret = virsh.vol_pool("%s/%s" % (disk_src_pool, vol_name))
         libvirt.check_exit_status(ret)
-        if pool_name not in ret.stdout:
+        if pool_name not in ret.stdout.strip():
             test.fail("Volume pool isn't correct")
         # vol-name
         ret = virsh.vol_name("%s/%s" % (disk_src_pool, vol_name))
         libvirt.check_exit_status(ret)
-        if vol_name not in ret.stdout:
+        if vol_name not in ret.stdout.strip():
             test.fail("Volume name isn't correct")
         # vol-resize
         ret = virsh.vol_resize(vol_name, "2G", pool_name)
@@ -216,7 +230,7 @@ def run(test, params, env):
         """
         Test save and restore operation
         """
-        save_file = os.path.join(test.tmpdir,
+        save_file = os.path.join(data_dir.get_tmp_dir(),
                                  "%s.save" % vm_name)
         ret = virsh.save(vm_name, save_file, **virsh_dargs)
         libvirt.check_exit_status(ret)
@@ -232,8 +246,8 @@ def run(test, params, env):
         Test snapshot operation.
         """
         snap_name = "s1"
-        snap_mem = os.path.join(test.tmpdir, "rbd.mem")
-        snap_disk = os.path.join(test.tmpdir, "rbd.disk")
+        snap_mem = os.path.join(data_dir.get_tmp_dir(), "rbd.mem")
+        snap_disk = os.path.join(data_dir.get_tmp_dir(), "rbd.disk")
         xml_snap_exp = ["disk name='%s' snapshot='external' type='file'" % target_dev]
         xml_dom_exp = ["source file='%s'" % snap_disk,
                        "backingStore type='network' index='1'",
@@ -250,7 +264,7 @@ def run(test, params, env):
             options = snap_name
 
         ret = virsh.snapshot_create_as(vm_name, options)
-        if test_disk_internal_snapshot:
+        if test_disk_internal_snapshot or test_disk_readonly:
             libvirt.check_result(ret, expected_fails=unsupported_err)
         else:
             libvirt.check_result(ret, skip_if=unsupported_err)
@@ -276,7 +290,7 @@ def run(test, params, env):
         """
         Block copy operation test.
         """
-        blk_file = os.path.join(test.tmpdir, "blk.rbd")
+        blk_file = os.path.join(data_dir.get_tmp_dir(), "blk.rbd")
         if os.path.exists(blk_file):
             os.remove(blk_file)
         blk_mirror = ("mirror type='file' file='%s' "
@@ -370,7 +384,7 @@ def run(test, params, env):
                 return False
             return True
 
-        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), e:
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
             logging.error(str(e))
             return False
 
@@ -386,7 +400,7 @@ def run(test, params, env):
         cmd = ("rbd -m {0} {1} snap"
                " list {2}"
                "".format(mon_host, key_opt, os.path.join(disk_src_pool, vol_name)))
-        snaps_out = process.run(cmd, ignore_status=True, shell=True).stdout
+        snaps_out = process.run(cmd, ignore_status=True, shell=True).stdout_text
         snap_names = []
         if snaps_out:
             for line in snaps_out.rsplit("\n"):
@@ -407,6 +421,61 @@ def run(test, params, env):
                " purge {2} && rbd -m {0} {1} rm {2}"
                "".format(mon_host, key_opt, os.path.join(disk_src_pool, vol_name)))
         process.run(cmd, ignore_status=True, shell=True)
+
+    def make_snapshot():
+        """
+        make external snapshots.
+
+        :return external snapshot path list
+        """
+        logging.info("Making snapshot...")
+        first_disk_source = vm.get_first_disk_devices()['source']
+        snapshot_path_list = []
+        snapshot2_file = os.path.join(data_dir.get_tmp_dir(), "mem.s2")
+        snapshot3_file = os.path.join(data_dir.get_tmp_dir(), "mem.s3")
+        snapshot4_file = os.path.join(data_dir.get_tmp_dir(), "mem.s4")
+        snapshot4_disk_file = os.path.join(data_dir.get_tmp_dir(), "disk.s4")
+        snapshot5_file = os.path.join(data_dir.get_tmp_dir(), "mem.s5")
+        snapshot5_disk_file = os.path.join(data_dir.get_tmp_dir(), "disk.s5")
+
+        # Attempt to take different types of snapshots.
+        snapshots_param_dict = {"s1": "s1 --disk-only --no-metadata",
+                                "s2": "s2 --memspec %s --no-metadata" % snapshot2_file,
+                                "s3": "s3 --memspec %s --no-metadata --live" % snapshot3_file,
+                                "s4": "s4 --memspec %s --diskspec vda,file=%s --no-metadata" % (snapshot4_file, snapshot4_disk_file),
+                                "s5": "s5 --memspec %s --diskspec vda,file=%s --live --no-metadata" % (snapshot5_file, snapshot5_disk_file)}
+        for snapshot_name in sorted(snapshots_param_dict.keys()):
+            ret = virsh.snapshot_create_as(vm_name, snapshots_param_dict[snapshot_name],
+                                           **virsh_dargs)
+            libvirt.check_exit_status(ret)
+            if snapshot_name != 's4' and snapshot_name != 's5':
+                snapshot_path_list.append(first_disk_source.replace('qcow2', snapshot_name))
+        return snapshot_path_list
+
+    def get_secret_list():
+        """
+        Get secret list.
+
+        :return secret list
+        """
+        logging.info("Get secret list ...")
+        secret_list_result = virsh.secret_list()
+        secret_list = results_stdout_52lts(secret_list_result).strip().splitlines()
+        # First two lines contain table header followed by entries
+        # for each secret, such as:
+        #
+        # UUID                                  Usage
+        # --------------------------------------------------------------------------------
+        # b4e8f6d3-100c-4e71-9f91-069f89742273  ceph client.libvirt secret
+        secret_list = secret_list[2:]
+        result = []
+        # If secret list is empty.
+        if secret_list:
+            for line in secret_list:
+                # Split on whitespace, assume 1 column
+                linesplit = line.split(None, 1)
+                result.append(linesplit[0])
+        return result
 
     mon_host = params.get("mon_host")
     disk_src_name = params.get("disk_source_name")
@@ -438,14 +507,21 @@ def run(test, params, env):
     pool_name = params.get("pool_name")
     pool_type = params.get("pool_type")
     vol_name = params.get("vol_name")
-    cloned_vol_name = params.get("cloned_volume")
-    create_from_cloned_volume = params.get("create_from_cloned_volume")
+    cloned_vol_name = params.get("cloned_volume", "cloned_test_volume")
+    create_from_cloned_volume = params.get("create_from_cloned_volume", "create_from_cloned_test_volume")
     vol_cap = params.get("vol_cap")
     vol_cap_unit = params.get("vol_cap_unit")
     start_vm = "yes" == params.get("start_vm", "no")
     test_disk_readonly = "yes" == params.get("test_disk_readonly", "no")
     test_disk_internal_snapshot = "yes" == params.get("test_disk_internal_snapshot", "no")
     test_json_pseudo_protocol = "yes" == params.get("json_pseudo_protocol", "no")
+    disk_snapshot_with_sanlock = "yes" == params.get("disk_internal_with_sanlock", "no")
+
+    # Create /etc/ceph/ceph.conf file to suppress false warning error message.
+    process.run("mkdir -p /etc/ceph", ignore_status=True, shell=True)
+    cmd = ("echo 'mon_host = {0}' >/etc/ceph/ceph.conf"
+           .format(mon_host))
+    process.run(cmd, ignore_status=True, shell=True)
 
     # Start vm and get all partions in vm.
     if vm.is_dead():
@@ -468,10 +544,11 @@ def run(test, params, env):
     vmxml_backup = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
     key_opt = ""
     secret_uuid = None
-    key_file = os.path.join(test.tmpdir, "ceph.key")
-    img_file = os.path.join(test.tmpdir,
+    snapshot_path = None
+    key_file = os.path.join(data_dir.get_tmp_dir(), "ceph.key")
+    img_file = os.path.join(data_dir.get_tmp_dir(),
                             "%s_test.img" % vm_name)
-    front_end_img_file = os.path.join(test.tmpdir,
+    front_end_img_file = os.path.join(data_dir.get_tmp_dir(),
                                       "%s_frontend_test.img" % vm_name)
     # Construct a unsupported error message list to skip these kind of tests
     unsupported_err = []
@@ -480,7 +557,12 @@ def run(test, params, env):
     if test_snapshot:
         unsupported_err.append('live disk snapshot not supported')
     if test_disk_readonly:
-        unsupported_err.append('Unable to read from monitor: Connection reset by peer')
+        if not libvirt_version.version_compare(5, 0, 0):
+            unsupported_err.append('Could not create file: Permission denied')
+            unsupported_err.append('Permission denied')
+        else:
+            unsupported_err.append('unsupported configuration: external snapshot ' +
+                                   'for readonly disk vdb is not supported')
     if test_disk_internal_snapshot:
         unsupported_err.append('unsupported configuration: internal snapshot for disk ' +
                                'vdb unsupported for storage type raw')
@@ -493,6 +575,75 @@ def run(test, params, env):
         unsupported_err.append('this function is not supported')
 
     try:
+        # Clean up dirty secrets in test environments if there have.
+        dirty_secret_list = get_secret_list()
+        if dirty_secret_list:
+            for dirty_secret_uuid in dirty_secret_list:
+                virsh.secret_undefine(dirty_secret_uuid)
+        # Prepare test environment.
+        qemu_config = LibvirtQemuConfig()
+
+        if disk_snapshot_with_sanlock:
+            # Install necessary package:sanlock,libvirt-lock-sanlock
+            if not utils_package.package_install(["sanlock"]):
+                test.error("fail to install sanlock")
+            if not utils_package.package_install(["libvirt-lock-sanlock"]):
+                test.error("fail to install libvirt-lock-sanlock")
+
+            # Set virt_use_sanlock
+            result = process.run("setsebool -P virt_use_sanlock 1", shell=True)
+            if result.exit_status:
+                test.error("Failed to set virt_use_sanlock value")
+
+            # Update lock_manager in qemu.conf
+            qemu_config.lock_manager = 'sanlock'
+
+            # Update qemu-sanlock.conf.
+            san_lock_config = LibvirtSanLockConfig()
+            san_lock_config.user = 'sanlock'
+            san_lock_config.group = 'sanlock'
+            san_lock_config.host_id = 1
+            san_lock_config.auto_disk_leases = True
+            process.run("mkdir -p /var/lib/libvirt/sanlock", shell=True)
+            san_lock_config.disk_lease_dir = "/var/lib/libvirt/sanlock"
+            san_lock_config.require_lease_for_disks = False
+
+            # Start sanlock service and restart libvirtd to enforce changes.
+            result = process.run("systemctl start wdmd", shell=True)
+            if result.exit_status:
+                test.error("Failed to start wdmd service")
+            result = process.run("systemctl start sanlock", shell=True)
+            if result.exit_status:
+                test.error("Failed to start sanlock service")
+            utils_libvirtd.Libvirtd().restart()
+
+            # Prepare lockspace and lease file for sanlock in order.
+            sanlock_cmd_dict = OrderedDict()
+            sanlock_cmd_dict["truncate -s 1M /var/lib/libvirt/sanlock/TEST_LS"] = "Failed to truncate TEST_LS"
+            sanlock_cmd_dict["sanlock direct init -s TEST_LS:0:/var/lib/libvirt/sanlock/TEST_LS:0"] = "Failed to sanlock direct init TEST_LS:0"
+            sanlock_cmd_dict["chown sanlock:sanlock /var/lib/libvirt/sanlock/TEST_LS"] = "Failed to chown sanlock TEST_LS"
+            sanlock_cmd_dict["restorecon -R -v /var/lib/libvirt/sanlock"] = "Failed to restorecon sanlock"
+            sanlock_cmd_dict["truncate -s 1M /var/lib/libvirt/sanlock/test-disk-resource-lock"] = "Failed to truncate test-disk-resource-lock"
+            sanlock_cmd_dict["sanlock direct init -r TEST_LS:test-disk-resource-lock:" +
+                             "/var/lib/libvirt/sanlock/test-disk-resource-lock:0"] = "Failed to sanlock direct init test-disk-resource-lock"
+            sanlock_cmd_dict["chown sanlock:sanlock " +
+                             "/var/lib/libvirt/sanlock/test-disk-resource-lock"] = "Failed to chown test-disk-resource-loc"
+            sanlock_cmd_dict["sanlock client add_lockspace -s TEST_LS:1:" +
+                             "/var/lib/libvirt/sanlock/TEST_LS:0"] = "Failed to client add_lockspace -s TEST_LS:0"
+            for sanlock_cmd in sanlock_cmd_dict.keys():
+                result = process.run(sanlock_cmd, shell=True)
+                if result.exit_status:
+                    test.error(sanlock_cmd_dict[sanlock_cmd])
+
+            # Create one lease device and add it to VM.
+            san_lock_vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
+            lease_device = Lease()
+            lease_device.lockspace = 'TEST_LS'
+            lease_device.key = 'test-disk-resource-lock'
+            lease_device.target = {'path': '/var/lib/libvirt/sanlock/test-disk-resource-lock'}
+            san_lock_vmxml.add_device(lease_device)
+            san_lock_vmxml.sync()
+
         # Install ceph-common package which include rbd command
         if utils_package.package_install(["ceph-common"]):
             if client_name and client_key:
@@ -512,7 +663,7 @@ def run(test, params, env):
                 libvirt.check_exit_status(ret)
 
                 secret_uuid = re.findall(r".+\S+(\ +\S+)\ +.+\S+",
-                                         ret.stdout)[0].lstrip()
+                                         ret.stdout.strip())[0].lstrip()
                 logging.debug("Secret uuid %s", secret_uuid)
                 if secret_uuid is None:
                     test.error("Failed to get secret uuid")
@@ -554,7 +705,7 @@ def run(test, params, env):
             first_disk = vm.get_first_disk_devices()
             blk_source = first_disk['source']
             # Convert the image to remote storage
-            disk_cmd = ("rbd -m %s %s info %s || qemu-img convert"
+            disk_cmd = ("rbd -m %s %s info %s 2> /dev/null|| qemu-img convert"
                         " -O %s %s %s" % (mon_host, key_opt,
                                           disk_src_name, disk_format,
                                           blk_source, disk_path))
@@ -573,7 +724,7 @@ def run(test, params, env):
                         (disk_format, img_file, img_file))
             process.run(disk_cmd, ignore_status=False, shell=True)
             # Convert the image to remote storage
-            disk_cmd = ("rbd -m %s %s info %s || qemu-img convert -O"
+            disk_cmd = ("rbd -m %s %s info %s 2> /dev/null|| qemu-img convert -O"
                         " %s %s %s" % (mon_host, key_opt, disk_src_name,
                                        disk_format, img_file, disk_path))
             process.run(disk_cmd, ignore_status=False, shell=True)
@@ -594,10 +745,12 @@ def run(test, params, env):
                             (json_str, front_end_img_file))
                 disk_path = front_end_img_file
                 process.run(disk_cmd, ignore_status=False, shell=True)
-        # If hot plug, start VM first, otherwise stop VM if running.
+        # If hot plug, start VM first, and then wait the OS boot.
+        # Otherwise stop VM if running.
         if start_vm:
             if vm.is_dead():
                 vm.start()
+            vm.wait_for_login().close()
         else:
             if not vm.is_dead():
                 vm.destroy()
@@ -617,6 +770,9 @@ def run(test, params, env):
                 if "secret_usage" in params:
                     params.pop("secret_usage")
             xml_file = libvirt.create_disk_xml(params)
+            if additional_guest:
+                # Copy xml_file for additional guest VM.
+                shutil.copyfile(xml_file, additional_xml_file)
             opts = params.get("attach_option", "")
             ret = virsh.attach_device(vm_name, xml_file,
                                       flagstr=opts, debug=True)
@@ -625,7 +781,8 @@ def run(test, params, env):
                 # Make sure the additional VM is running
                 if additional_vm.is_dead():
                     additional_vm.start()
-                ret = virsh.attach_device(guest_name, xml_file,
+                    additional_vm.wait_for_login().close()
+                ret = virsh.attach_device(guest_name, additional_xml_file,
                                           "", debug=True)
                 libvirt.check_result(ret, skip_if=unsupported_err)
         elif attach_disk:
@@ -646,6 +803,12 @@ def run(test, params, env):
             ret = virsh.attach_device(vm_name, xml_file,
                                       flagstr=opts, debug=True)
             libvirt.check_result(ret, skip_if=unsupported_err)
+        elif disk_snapshot_with_sanlock:
+            if vm.is_dead():
+                vm.start()
+            snapshot_path = make_snapshot()
+            if vm.is_alive():
+                vm.destroy()
         elif not create_volume:
             libvirt.set_vm_disk(vm, params)
         if test_blockcopy:
@@ -710,14 +873,17 @@ def run(test, params, env):
                           " after detachment")
             session.close()
 
-    except virt_vm.VMStartError, details:
+    except virt_vm.VMStartError as details:
         for msg in unsupported_err:
             if msg in str(details):
-                test.skip(details)
+                test.cancel(str(details))
         else:
             test.fail("VM failed to start."
                       "Error: %s" % str(details))
     finally:
+        # Remove /etc/ceph/ceph.conf file if exists.
+        if os.path.exists('/etc/ceph/ceph.conf'):
+            os.remove('/etc/ceph/ceph.conf')
         # Delete snapshots.
         snapshot_lists = virsh.snapshot_list(vm_name)
         if len(snapshot_lists) > 0:
@@ -759,13 +925,30 @@ def run(test, params, env):
         # Clean up volume, pool
         if vol_name and vol_name in str(virsh.vol_list(pool_name).stdout):
             virsh.vol_delete(vol_name, pool_name)
-        if pool_name and virsh.pool_state_dict().has_key(pool_name):
+        if pool_name and pool_name in virsh.pool_state_dict():
             virsh.pool_destroy(pool_name, **virsh_dargs)
             virsh.pool_undefine(pool_name, **virsh_dargs)
 
         # Clean up secret
-        if secret_uuid:
-            virsh.secret_undefine(secret_uuid)
+        secret_list = get_secret_list()
+        if secret_list:
+            for secret_uuid in secret_list:
+                virsh.secret_undefine(secret_uuid)
 
         logging.info("Restoring vm...")
         vmxml_backup.sync()
+
+        if disk_snapshot_with_sanlock:
+            # Restore virt_use_sanlock setting.
+            process.run("setsebool -P virt_use_sanlock 0", shell=True)
+            # Restore qemu config
+            qemu_config.restore()
+            utils_libvirtd.Libvirtd().restart()
+            # Force shutdown sanlock service.
+            process.run("sanlock client shutdown -f 1", shell=True)
+            # Clean up lockspace folder
+            process.run("rm -rf  /var/lib/libvirt/sanlock/*", shell=True)
+            if snapshot_path is not None:
+                for snapshot in snapshot_path:
+                    if os.path.exists(snapshot):
+                        os.remove(snapshot)

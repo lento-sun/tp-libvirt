@@ -40,9 +40,9 @@ def get_symbols_by_blk(blkdev, method="by-path"):
         cmd += "{if ($f ~ /pci/){print $f}}}'"
         cmd %= (dir_path, blkdev, blkdev)
         result = process.run(cmd, shell=True)
-    except process.cmdError, detail:
+    except process.cmdError as detail:
         raise exceptions.TestError(str(detail))
-    symbolic_links = result.stdout.strip().splitlines()
+    symbolic_links = result.stdout_text.strip().splitlines()
     return symbolic_links
 
 
@@ -63,10 +63,10 @@ def get_blks_by_scsi(scsi_bus, blk_prefix="sd"):
     cmd %= (scsi_bus, blk_prefix)
     try:
         result = process.run(cmd, shell=True)
-        logging.debug("multipath result: %s", result.stdout)
-    except process.cmdError, detail:
+        logging.debug("multipath result: %s", result.stdout_text.strip())
+    except process.cmdError as detail:
         raise exceptions.TestError(str(detail))
-    blk_names = result.stdout.strip().splitlines()
+    blk_names = result.stdout_text.strip().splitlines()
     return blk_names
 
 
@@ -97,7 +97,7 @@ def create_qcow2_blk(path_to_dev, size):
     cmd = "qemu-img create -f qcow2 %s %s" % (path_to_dev, size)
     try:
         process.run(cmd, shell=True)
-    except process.cmdError, detail:
+    except process.cmdError as detail:
         raise exceptions.TestError("Failed to create qcow2 with %s: %s"
                                    % (path_to_dev, str(detail)))
 
@@ -134,22 +134,6 @@ def get_file_in_vm(session, file_path):
         file_existence = True
         file_content = output
     return file_existence, file_content
-
-
-def get_vm_blks(vm_name):
-    """
-    Get the list of vm's block devices
-    """
-    blk_list = []
-    data = virsh.domblklist(vm_name).stdout.splitlines()
-    for rec in data:
-        if rec.startswith("Target") or rec.startswith("---"):
-            continue
-        else:
-            pos = rec.find(" ")
-            if rec[:pos]:
-                blk_list.append(rec[:pos])
-    return blk_list
 
 
 def mkfs_and_mount(session, mount_disk):
@@ -212,11 +196,16 @@ def run(test, params, env):
     lun_sl = []
     new_disk = ""
     pool_ins = None
+    old_mpath_conf = ""
+    mpath_conf_path = "/etc/multipath.conf"
+    original_mpath_conf_exist = os.path.exists(mpath_conf_path)
 
     vm = env.get_vm(vm_name)
     online_hbas = utils_npiv.find_hbas("hba")
     if not online_hbas:
         raise exceptions.TestSkipError("There is no online hba cards.")
+    old_mpath_conf = utils_npiv.prepare_multipath_conf(conf_path=mpath_conf_path,
+                                                       replace_existing=True)
     first_online_hba = online_hbas[0]
     old_vhbas = utils_npiv.find_hbas("vhba")
     if vm.is_dead():
@@ -319,7 +308,7 @@ def run(test, params, env):
             cmd = "qemu-img create -f qcow2 %s %s" % (path_to_blk, disk_size)
             try:
                 process.run(cmd, shell=True)
-            except process.cmdError, detail:
+            except process.cmdError as detail:
                 raise exceptions.TestFail("Fail to create qcow2 on blk dev: %s",
                                           detail)
         else:
@@ -329,7 +318,7 @@ def run(test, params, env):
         if "vol" in vd_format:
             vol_list = utlv.get_vol_list(pool_name, vol_check=True,
                                          timeout=_TIMEOUT*3)
-            test_vol = vol_list.keys()[0]
+            test_vol = list(vol_list.keys())[0]
             disk_params = {'type_name': disk_type,
                            'target_dev': device_target,
                            'target_bus': target_bus,
@@ -366,7 +355,7 @@ def run(test, params, env):
 
         # virsh snapshot-create-as vm s --disk-only --diskspec vda,file=path
         if snapshot_disk_only:
-            vm_blks = get_vm_blks(vm_name)
+            vm_blks = list(vm.get_disk_devices().keys())
             options = "%s --disk-only" % snapshot_name
             for vm_blk in vm_blks:
                 snapshot_file = snapshot_dir + "/" + vm_blk + "." + snapshot_name
@@ -421,7 +410,7 @@ def run(test, params, env):
             logging.debug("result of snapshot-delete: %s",
                           result.stdout.strip())
             if snapshot_disk_only:
-                vm_blks = get_vm_blks(vm_name)
+                vm_blks = list(vm.get_disk_devices().keys())
                 for vm_blk in vm_blks:
                     snapshot_file = snapshot_dir + "/" + vm_blk + "." + snap
                     if os.path.exists(snapshot_file):
@@ -429,7 +418,7 @@ def run(test, params, env):
         snapshot_list = virsh.snapshot_list(vm_name)
         if snapshot_list:
             raise exceptions.TestFail("Snapshot not deleted: %s", snapshot_list)
-    except Exception, detail:
+    except Exception as detail:
         raise exceptions.TestFail("exception happens: %s", detail)
     finally:
         logging.debug("Start to clean up env...")
@@ -439,3 +428,9 @@ def run(test, params, env):
         for new_vhba in new_vhbas:
             virsh.nodedev_destroy(new_vhba)
         utils_npiv.restart_multipathd()
+        if old_mpath_conf:
+            utils_npiv.prepare_multipath_conf(conf_path=mpath_conf_path,
+                                              conf_content=old_mpath_conf,
+                                              replace_existing=True)
+        if not original_mpath_conf_exist and os.path.exists(mpath_conf_path):
+            os.remove(mpath_conf_path)

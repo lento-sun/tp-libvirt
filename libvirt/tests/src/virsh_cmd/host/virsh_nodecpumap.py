@@ -1,9 +1,9 @@
 import os
 import logging
+import random
 
-from autotest.client import utils
-from autotest.client.shared import error
-
+from avocado.utils import process
+from avocado.utils import cpu
 from virttest import virsh
 
 SYSFS_SYSTEM_PATH = "/sys/devices/system/cpu"
@@ -17,8 +17,8 @@ def get_present_cpu():
     """
     if os.path.exists("%s/cpu0" % SYSFS_SYSTEM_PATH):
         cmd = "ls %s | grep cpu[0-9] | wc -l" % SYSFS_SYSTEM_PATH
-        cmd_result = utils.run(cmd, ignore_status=True)
-        present = int(cmd_result.stdout.strip())
+        cmd_result = process.run(cmd, ignore_status=True, shell=True)
+        present = int(cmd_result.stdout_text.strip())
     else:
         present = None
 
@@ -77,8 +77,8 @@ def get_online_cpu(option=''):
 
     if os.path.exists("%s/online" % SYSFS_SYSTEM_PATH):
         cmd = "cat %s/online" % SYSFS_SYSTEM_PATH
-        cmd_result = utils.run(cmd, ignore_status=True)
-        output = cmd_result.stdout.strip()
+        cmd_result = process.run(cmd, ignore_status=True, shell=True)
+        output = cmd_result.stdout_text.strip()
         if 'pretty' in option:
             return tuple(output)
         if ',' in output:
@@ -93,8 +93,8 @@ def get_online_cpu(option=''):
             if i != 0:
                 if os.path.exists("%s/cpu%s/online" % (SYSFS_SYSTEM_PATH, i)):
                     cmd = "cat %s/cpu%s/online" % (SYSFS_SYSTEM_PATH, i)
-                    cmd_result = utils.run(cmd, ignore_status=True)
-                    output = cmd_result.stdout.strip()
+                    cmd_result = process.run(cmd, ignore_status=True, shell=True)
+                    output = cmd_result.stdout_text.strip()
                     if int(output) == 1:
                         cpu_map_list[i] = 'y'
                 else:
@@ -102,6 +102,77 @@ def get_online_cpu(option=''):
         cpu_map = tuple(cpu_map_list)
 
     return cpu_map
+
+
+def check_result(result, option, status_error, test):
+    """
+    Check result of virsh nodecpumap
+    :param result: The Cmd object of virsh nodecpumap
+    :param option: The option of virsh nodecpumap
+    :param status_error: Expect status error or not
+    :param test: The test object
+    :return: Success or raise Exception
+    """
+
+    output = result.stdout.strip()
+    status = result.exit_status
+    if status_error == "yes":
+        if status == 0:
+            test.fail("Run successfully with wrong command!")
+        else:
+            logging.info("Run failed as expected")
+    else:
+        out_value = []
+        out = output.split('\n')
+        for i in range(3):
+            out_value.append(out[i].split()[-1])
+
+        present = get_present_cpu()
+        if not present:
+            test.cancel("Host cpu counting not supported")
+        else:
+            if present != int(out_value[0]):
+                test.fail("Present cpu is not expected")
+
+        cpu_map = get_online_cpu(option)
+        if not cpu_map:
+            test.cancel("Host cpu map not supported")
+        else:
+            if cpu_map != tuple(out_value[2]):
+                logging.info(cpu_map)
+                logging.info(tuple(out_value[2]))
+                test.fail("Cpu map is not expected")
+
+        online = 0
+        if 'pretty' in option:
+            cpu_map = get_online_cpu()
+        for i in range(present):
+            if cpu_map[i] == 'y':
+                online += 1
+        if online != int(out_value[1]):
+            test.fail("Online cpu is not expected")
+
+
+def turn_off_on_cpu(cpu, off, test):
+    """
+    Turn off/on cpu
+    :param cpu: CPU name like 'cpu3'
+    :param off: Turn off or turn on the cpu.
+                True means off, False means on
+    :param test: The test object
+    :return: Success or raise exception
+    """
+
+    if off:
+        logging.debug("Turn off %s", cpu)
+        cmd = "echo 0 > %s/%s/online" % (SYSFS_SYSTEM_PATH, cpu)
+    else:
+        logging.debug("Turn on %s", cpu)
+        cmd = "echo 1 > %s/%s/online" % (SYSFS_SYSTEM_PATH, cpu)
+
+    ret = process.run(cmd, shell=True, ignore_status=True)
+    if ret.exit_status:
+        test.fail("Failed to set cpu: %s" % ret.stderr_text)
 
 
 def run(test, params, env):
@@ -115,44 +186,19 @@ def run(test, params, env):
 
     option = params.get("virsh_node_options")
     status_error = params.get("status_error")
+    cpu_off_on_test = params.get("cpu_off_on", "no") == "yes"
+    online_cpus = cpu.cpu_online_list()
+    test_cpu = random.choice(online_cpus)
+
+    if cpu_off_on_test:
+        # Turn off CPU
+        cpu.offline(test_cpu)
 
     result = virsh.nodecpumap(option, ignore_status=True, debug=True)
-    output = result.stdout.strip()
-    status = result.exit_status
+    check_result(result, option, status_error, test)
 
-    # Check result
-    if status_error == "yes":
-        if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
-        else:
-            logging.info("Run failed as expected")
-    else:
-        out_value = []
-        out = output.split('\n')
-        for i in range(3):
-            out_value.append(out[i].split()[-1])
-
-        present = get_present_cpu()
-        if not present:
-            raise error.TestNAError("Host cpu counting not supported")
-        else:
-            if present != int(out_value[0]):
-                raise error.TestFail("Present cpu is not expected")
-
-        cpu_map = get_online_cpu(option)
-        if not cpu_map:
-            raise error.TestNAError("Host cpu map not supported")
-        else:
-            if cpu_map != tuple(out_value[2]):
-                logging.info(cpu_map)
-                logging.info(tuple(out_value[2]))
-                raise error.TestFail("Cpu map is not expected")
-
-        online = 0
-        if 'pretty' in option:
-            cpu_map = get_online_cpu()
-        for i in range(present):
-            if cpu_map[i] == 'y':
-                online += 1
-        if online != int(out_value[1]):
-            raise error.TestFail("Online cpu is not expected")
+    if cpu_off_on_test:
+        # Turn on CPU and check again
+        cpu.online(test_cpu)
+        result = virsh.nodecpumap(option, ignore_status=True, debug=True)
+        check_result(result, option, status_error, test)

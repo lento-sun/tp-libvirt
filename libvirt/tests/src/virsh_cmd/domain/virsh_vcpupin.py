@@ -44,11 +44,15 @@ def run(test, params, env):
         :param vcpu: VM cpu pid
         :return : list of affinity to vcpus
         """
-        total_cpu = process.run("ls -d /sys/devices/system/cpu/cpu[0-9]* |wc -l", shell=True).stdout.strip()
+        total_cpu = process.run("ls -d /sys/devices/system/cpu/cpu[0-9]* |wc -l", shell=True).stdout_text.strip()
         vcpus_affinity = {}
         output = virsh.vcpupin(vm_name).stdout
         for item in output.split('\n')[2:-2]:
-            vcpus_affinity[item.split(':')[0].strip()] = item.split(':')[1].strip()
+            item = item.strip()
+            split_key = ' '
+            if ':' in item:
+                split_key = ':'
+            vcpus_affinity[item.split(split_key)[0].strip()] = item.split(split_key)[-1].strip()
         return utils_test.libvirt.cpus_string_to_affinity_list(
             vcpus_affinity[str(vcpu)], int(total_cpu))
 
@@ -64,7 +68,7 @@ def run(test, params, env):
         :param vcpu: VM cpu pid
         """
 
-        total_cpu = process.run("ls -d /sys/devices/system/cpu/cpu[0-9]* |wc -l", shell=True).stdout.strip()
+        total_cpu = process.run("ls -d /sys/devices/system/cpu/cpu[0-9]* |wc -l", shell=True).stdout_text.strip()
         logging.debug("Debug: cpulist %s", cpu_list)
         expected_output = utils_test.libvirt.cpus_string_to_affinity_list(
             cpu_list,
@@ -193,8 +197,17 @@ def run(test, params, env):
                                        vcpucount_option).stdout.strip()
 
     # Find the alive cpus list
-    cpus_list = map(str, cpuutils.cpu_online_list())
+    cpus_list = list(map(str, cpuutils.cpu_online_list()))
     logging.info("Active cpus in host are %s", cpus_list)
+
+    # If the cpus_list has too many cpus, then only test the
+    # cpus of the head, middle and tail part
+    lenght = len(cpus_list)
+    if lenght > 30:
+        cpus_list = cpus_list[:10] + \
+                    cpus_list[lenght//2 - 5: lenght//2 + 5] + \
+                    cpus_list[lenght - 10:]
+        logging.info('Will run test on cpus: %s', cpus_list)
 
     try:
         # Control multi domain vcpu affinity

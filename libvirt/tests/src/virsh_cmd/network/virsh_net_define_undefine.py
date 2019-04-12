@@ -1,12 +1,14 @@
 import logging
 
-from autotest.client.shared import utils, error
+from avocado.utils import process
 
 from virttest import virsh
 from virttest import libvirt_vm
 from virttest import xml_utils
 from virttest import utils_libvirtd
 from virttest.libvirt_xml import network_xml
+from virttest.utils_test import libvirt
+from virttest.compat_52lts import decode_to_text as to_text
 
 from provider import libvirt_version
 
@@ -36,6 +38,21 @@ def get_network_xml_instance(virsh_dargs, test_xml, net_name,
     return test_netxml
 
 
+def set_ip_section(testnet_xml, addr, ipv6=False, **dargs):
+    ipxml = network_xml.IPXML(ipv6=ipv6)
+    ipxml.address = addr
+    if "netmask" in dargs:
+        ipxml.netmask = dargs["netmask"]
+    elif "prefix_v6" in dargs:
+        ipxml.prefix = dargs["prefix_v6"]
+        ipxml.family = "ipv6"
+    if "dhcp_ranges_start" in dargs and dargs["dhcp_ranges_start"] is not None:
+        dhcp_ranges_start = dargs["dhcp_ranges_start"]
+        dhcp_ranges_end = dargs["dhcp_ranges_end"]
+        ipxml.dhcp_ranges = {"start": dhcp_ranges_start, "end": dhcp_ranges_end}
+    testnet_xml.set_ip(ipxml)
+
+
 def run(test, params, env):
     """
     Test command: virsh net-define/net-undefine.
@@ -57,6 +74,34 @@ def run(test, params, env):
     remove_existing = params.get("net_define_undefine_remove_existing", "yes")
     status_error = "yes" == params.get("status_error", "no")
     check_states = "yes" == params.get("check_states", "no")
+    net_persistent = "yes" == params.get("net_persistent")
+    net_active = "yes" == params.get("net_active")
+    expect_msg = params.get("net_define_undefine_err_msg")
+
+    # define multi ip/dhcp sections in network
+    multi_ip = "yes" == params.get("multi_ip", "no")
+    netmask = params.get("netmask")
+    prefix_v6 = params.get("prefix_v6")
+    single_v6_range = "yes" == params.get("single_v6_range", "no")
+    # Get 2nd ipv4 dhcp range
+    dhcp_ranges_start = params.get("dhcp_ranges_start", None)
+    dhcp_ranges_end = params.get("dhcp_ranges_end", None)
+
+    # Get 2 groups of ipv6 ip address and dhcp section
+    address_v6_1 = params.get("address_v6_1")
+    dhcp_ranges_v6_start_1 = params.get("dhcp_ranges_v6_start_1", None)
+    dhcp_ranges_v6_end_1 = params.get("dhcp_ranges_v6_end_1", None)
+
+    address_v6_2 = params.get("address_v6_2")
+    dhcp_ranges_v6_start_2 = params.get("dhcp_ranges_v6_start_2", None)
+    dhcp_ranges_v6_end_2 = params.get("dhcp_ranges_v6_end_2", None)
+
+    # Edit net xml forward/ip part then define/start to check invalid setting
+    edit_xml = "yes" == params.get("edit_xml", "no")
+    address_v4 = params.get("address_v4")
+    nat_port_start = params.get("nat_port_start")
+    nat_port_end = params.get("nat_port_end")
+    test_port = "yes" == params.get("test_port", "no")
 
     virsh_dargs = {'uri': uri, 'debug': False, 'ignore_status': True}
     virsh_instance = virsh.VirshPersistent(**virsh_dargs)
@@ -64,8 +109,8 @@ def run(test, params, env):
     # libvirt acl polkit related params
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     virsh_uri = params.get("virsh_uri")
     unprivileged_user = params.get('unprivileged_user')
@@ -85,13 +130,13 @@ def run(test, params, env):
         test_xml.write(str(backup['default']))
         test_xml.flush()
     except (KeyError, AttributeError):
-        raise error.TestNAError("Test requires default network to exist")
+        test.cancel("Test requires default network to exist")
 
     testnet_xml = get_network_xml_instance(virsh_dargs, test_xml, net_name,
                                            net_uuid, bridge=None)
 
     if remove_existing:
-        for netxml in backup.values():
+        for netxml in list(backup.values()):
             netxml.orbital_nuclear_strike()
 
     # Test both define and undefine, So collect info
@@ -118,9 +163,47 @@ def run(test, params, env):
         virsh_dargs = {'uri': virsh_uri, 'unprivileged_user': unprivileged_user,
                        'debug': False, 'ignore_status': True}
         cmd = "chmod 666 %s" % testnet_xml.xml
-        utils.system(cmd)
+        process.run(cmd, shell=True)
 
+    if params.get('net_define_undefine_readonly', 'no') == 'yes':
+        virsh_dargs = {'uri': uri, 'debug': False, 'ignore_status': True,
+                       'readonly': True}
     try:
+        if edit_xml:
+            ipxml_v4 = network_xml.IPXML()
+            ipxml_v4.address = address_v4
+            ipxml_v4.netmask = netmask
+            ipxml_v4.dhcp_ranges = {"start": dhcp_ranges_start, "end": dhcp_ranges_end}
+            testnet_xml.del_ip()
+            testnet_xml.set_ip(ipxml_v4)
+            if test_port:
+                nat_port = {"start": nat_port_start, "end": nat_port_end}
+                testnet_xml.nat_port = nat_port
+            testnet_xml.debug_xml()
+        if multi_ip:
+            # Enabling IPv6 forwarding with RA routes without accept_ra set to 2
+            # is likely to cause routes loss
+            sysctl_cmd = 'sysctl net.ipv6.conf.all.accept_ra'
+            original_accept_ra = to_text(
+                process.system_output(sysctl_cmd + ' -n'))
+            if original_accept_ra != '2':
+                process.system(sysctl_cmd + '=2')
+            # add another ipv4 address and dhcp range
+            set_ip_section(testnet_xml, address_v4, ipv6=False,
+                           netmask=netmask,
+                           dhcp_ranges_start=dhcp_ranges_start,
+                           dhcp_ranges_end=dhcp_ranges_end)
+            # add ipv6 address and dhcp range
+            set_ip_section(testnet_xml, address_v6_1, ipv6=True,
+                           prefix_v6=prefix_v6,
+                           dhcp_ranges_start=dhcp_ranges_v6_start_1,
+                           dhcp_ranges_end=dhcp_ranges_v6_end_1)
+            # 2nd ipv6 address and dhcp range
+            set_ip_section(testnet_xml, address_v6_2, ipv6=True,
+                           prefix_v6=prefix_v6,
+                           dhcp_ranges_start=dhcp_ranges_v6_start_2,
+                           dhcp_ranges_end=dhcp_ranges_v6_end_2)
+        testnet_xml.debug_xml()
         # Run test case
         define_result = virsh.net_define(define_options, define_extra,
                                          **virsh_dargs)
@@ -136,6 +219,9 @@ def run(test, params, env):
                 fail_flag = 1
                 result_info.append("Found wrong network states for "
                                    "defined netowrk: %s" % str(net_state))
+
+        if define_status == 1 and status_error and expect_msg:
+            libvirt.check_result(define_result, expect_msg.split(';'))
 
         # If defining network succeed, then trying to start it.
         if define_status == 0:
@@ -183,18 +269,37 @@ def run(test, params, env):
                 fail_flag = 1
                 result_info.append("Found wrong network state after restarting"
                                    " libvirtd: %s" % str(net_state))
-            # Undefine an active network and check state
+            logging.debug("undefine network:")
+            # prepare the network status
+            if not net_persistent:
+                virsh.net_undefine(net_name, ignore_status=False)
+            if not net_active:
+                virsh.net_destroy(net_name, ignore_status=False)
             undefine_status = virsh.net_undefine(undefine_options, undefine_extra,
                                                  **virsh_dargs).exit_status
-            if not undefine_status:
-                net_state = virsh_instance.net_state_dict()
-                if (not net_state[net_name]['active'] or
-                        net_state[net_name]['autostart'] or
-                        net_state[net_name]['persistent']):
-                    fail_flag = 1
-                    result_info.append("Found wrong network states for "
-                                       "undefined netowrk: %s" % str(net_state))
 
+            net_state = virsh_instance.net_state_dict()
+            if net_persistent:
+                if undefine_status:
+                    fail_flag = 1
+                    result_info.append("undefine should succeed but failed")
+                if net_active:
+                    if (not net_state[net_name]['active'] or
+                            net_state[net_name]['autostart'] or
+                            net_state[net_name]['persistent']):
+                        fail_flag = 1
+                        result_info.append("Found wrong network states for "
+                                           "undefined netowrk: %s" % str(net_state))
+                else:
+                    if net_name in net_state:
+                        fail_flag = 1
+                        result_info.append("Transient network should not exists "
+                                           "after undefine : %s" % str(net_state))
+            else:
+                if not undefine_status:
+                    fail_flag = 1
+                    result_info.append("undefine transient network should fail "
+                                       "but succeed: %s" % str(net_state))
         # Stop network for undefine test anyway
         destroy_result = virsh.net_destroy(net_name, extra="", **virsh_dargs)
         logging.debug(destroy_result)
@@ -211,11 +316,11 @@ def run(test, params, env):
         # Recover environment
         leftovers = network_xml.NetworkXML.new_all_networks_dict(
             virsh_instance)
-        for netxml in leftovers.values():
+        for netxml in list(leftovers.values()):
             netxml.orbital_nuclear_strike()
 
         # Recover from backup
-        for netxml in backup.values():
+        for netxml in list(backup.values()):
             netxml.sync(backup_state[netxml.name])
 
         # Close down persistent virsh session (including for all netxml copies)
@@ -229,8 +334,8 @@ def run(test, params, env):
     # Check status_error
     # If fail_flag is set, it must be transaction test.
     if fail_flag:
-        raise error.TestFail("Define network for transaction test "
-                             "failed:%s", result_info)
+        test.fail("Define network for transaction test "
+                  "failed:%s" % result_info)
 
     # The logic to check result:
     # status_error&only undefine:it is negative undefine test only
@@ -240,24 +345,24 @@ def run(test, params, env):
     if status_error:
         if trans_ref == "undefine":
             if undefine_status == 0:
-                raise error.TestFail("Run successfully with wrong command.")
+                test.fail("Run successfully with wrong command.")
         else:
             if define_status == 0:
                 if start_status == 0:
-                    raise error.TestFail("Define an unexpected network, "
-                                         "and start it successfully.")
+                    test.fail("Define an unexpected network, "
+                              "and start it successfully.")
                 else:
-                    raise error.TestFail("Define an unexpected network, "
-                                         "but start it failed.")
+                    test.fail("Define an unexpected network, "
+                              "but start it failed.")
     else:
         if trans_ref == "undefine":
             if undefine_status:
-                raise error.TestFail("Define network for transaction "
-                                     "successfully, but undefine failed.")
+                test.fail("Define network for transaction "
+                          "successfully, but undefine failed.")
         else:
             if define_status != 0:
-                raise error.TestFail("Run failed with right command")
+                test.fail("Run failed with right command")
             else:
                 if start_status != 0:
-                    raise error.TestFail("Network is defined as expected, "
-                                         "but start it failed.")
+                    test.fail("Network is defined as expected, "
+                              "but start it failed.")

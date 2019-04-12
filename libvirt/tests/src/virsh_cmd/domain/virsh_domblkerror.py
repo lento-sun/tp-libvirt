@@ -9,6 +9,7 @@ from avocado.utils import distro
 from virttest import virsh
 from virttest import data_dir
 from virttest import utils_misc
+from virttest import utils_package
 from virttest.utils_test import libvirt
 from virttest.libvirt_xml import vm_xml
 from virttest.libvirt_xml.devices.disk import Disk
@@ -37,13 +38,22 @@ def run(test, params, env):
     pool_name = params.get("domblkerror_pool_name", "fs_pool")
     vol_name = params.get("domblkerror_vol_name", "vol1")
     ubuntu = distro.detect().name == 'Ubuntu'
+    rhel = distro.detect().name == 'rhel'
     nfs_service_package = params.get("nfs_service_package", "nfs-kernel-server")
     nfs_service = None
+    session = None
+    selinux_bak = ""
 
     vm = env.get_vm(vm_name)
-    # backup /etc/exports
-    shutil.copyfile(export_file, "%s.bak" % export_file)
-    selinux_bak = ""
+    if error_type == "unspecified error":
+        if not ubuntu and not rhel:
+            nfs_service_package = "nfs"
+        elif rhel:
+            nfs_service_package = "nfs-server"
+        if not rhel and not utils_package.package_install(nfs_service_package):
+            test.cancel("NFS package not available in guest to test")
+        # backup /etc/exports
+        shutil.copyfile(export_file, "%s.bak" % export_file)
     # backup xml
     vmxml_backup = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
 
@@ -73,7 +83,6 @@ def run(test, params, env):
                                                export_dir=img_dir)
             if not ubuntu:
                 selinux_bak = res["selinux_status_bak"]
-                nfs_service_package = "nfs"
             process.run("mount -o nolock,soft,timeo=1,retrans=1,retry=0 "
                         "127.0.0.1:%s %s" % (img_dir, nfs_dir), shell=True,
                         verbose=True)
@@ -150,7 +159,7 @@ def run(test, params, env):
             try:
                 session.cmd("dd if=/dev/zero of=%s/big_file bs=1024 "
                             "count=51200 && sync" % mnt_dir)
-            except Exception, err:
+            except Exception as err:
                 logging.debug("Expected Fail %s", err)
             session.close()
 
@@ -170,6 +179,7 @@ def run(test, params, env):
 
         if not utils_misc.wait_for(_check_state, timeout):
             # If not paused, perform one more IO operation to the mnt disk
+            session = vm.wait_for_login()
             session.cmd("echo 'one more write to big file' > %s/big_file" % mnt_dir)
             if not utils_misc.wait_for(_check_state, 60):
                 test.fail("Guest does not paused, it is %s now" % vm.state())
@@ -187,6 +197,8 @@ def run(test, params, env):
                 test.fail("Fail to get domblkerror info:%s" % output.stderr)
     finally:
         logging.info("Do clean steps")
+        if session:
+            session.close()
         if error_type == "unspecified error":
             if nfs_service is not None:
                 nfs_service.start()

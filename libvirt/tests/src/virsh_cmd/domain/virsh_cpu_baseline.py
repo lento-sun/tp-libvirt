@@ -3,11 +3,10 @@ import os
 import logging
 from xml.dom.minidom import parseString
 
-from autotest.client.shared import error
-
 from virttest import virsh
 from virttest.libvirt_xml import vm_xml
 from virttest.utils_test import libvirt
+from virttest import data_dir
 
 
 def run(test, params, env):
@@ -29,7 +28,6 @@ def run(test, params, env):
         :param test_feature: test feature element.
         """
         content = """
-<host>
  <cpu>
   <arch>x86_64</arch>
   <model>pentium3</model>
@@ -44,11 +42,9 @@ def run(test, params, env):
   <feature name="sse2"/>
   <feature name="%s"/>
   </cpu>
-</host>
 """ % (test_feature, test_feature)
-        xmlfile = open(cpu_xmlfile, 'w')
-        xmlfile.write(content)
-        xmlfile.close()
+        with open(cpu_xmlfile, 'w') as xmlfile:
+            xmlfile.write(content)
 
     def check_xml(xml_output, test_feature):
         """
@@ -64,7 +60,7 @@ def run(test, params, env):
             feature_name += names.getAttribute("name")
         dom.unlink()
         if not re.search(test_feature, feature_name):
-            raise error.TestFail("Cannot see '%s' feature" % test_feature)
+            test.fail("Cannot see '%s' feature" % test_feature)
 
     # Get all parameters.
     file_name = params.get("cpu_baseline_cpu_file", "cpu.xml")
@@ -72,7 +68,7 @@ def run(test, params, env):
     extra = params.get("cpu_baseline_extra", "")
     test_feature = params.get("cpu_baseline_test_feature", "acpi")
     status_error = "yes" == params.get("status_error", "no")
-    cpu_xmlfile = os.path.join(test.tmpdir, file_name)
+    cpu_xmlfile = os.path.join(data_dir.get_tmp_dir(), file_name)
 
     # Prepare a xml file.
     create_attach_xml(cpu_xmlfile, test_feature)
@@ -91,11 +87,11 @@ def run(test, params, env):
     # Check status_error
     if status_error:
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
         logging.debug("Command fail as expected")
     else:
         if status != 0:
-            raise error.TestFail("Run failed with right command")
+            test.fail("Run failed with right command")
         check_xml(output, test_feature)
 
     # Use the output to config VM
@@ -117,7 +113,7 @@ def run(test, params, env):
             result = virsh.start(vm_name, ignore_status=True, debug=True)
             libvirt.check_exit_status(result)
             vm_pid = vm.get_pid()
-        except:
+        except Exception:
             pass
         else:
             # Check qemu cmdline
@@ -126,16 +122,16 @@ def run(test, params, env):
             if cpu_model in vm_cmdline:
                 logging.debug("Find cpu model '%s' in VM cmdline", cpu_model)
             else:
-                raise error.TestFail("Not find cpu model '%s' in VM cmdline" %
-                                     cpu_model)
+                test.fail("Not find cpu model '%s' in VM cmdline" %
+                          cpu_model)
             for feature in cpu_feature_list:
                 feature_name = feature.get('name')
                 if feature_name in vm_cmdline:
                     logging.debug("Find cpu feature '%s' in VM cmdline",
                                   feature_name)
                 else:
-                    raise error.TestFail("Not find cpu feature '%s' in VM "
-                                         "cmdline" % feature_name)
+                    test.fail("Not find cpu feature '%s' in VM "
+                              "cmdline" % feature_name)
         finally:
             if vm.is_alive():
                 vm.destroy(gracefully=False)

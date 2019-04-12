@@ -1,11 +1,11 @@
 import logging
 
-from autotest.client.shared import utils
-from autotest.client.shared import error
+from avocado.utils import process
 
 from virttest import virsh
 from virttest import virt_vm
 from virttest.libvirt_xml import vm_xml
+from virttest.utils_test import libvirt
 
 
 def run(test, params, env):
@@ -54,7 +54,7 @@ def run(test, params, env):
             size_darg_key = "size"
 
         if mem_ref == "halfless":
-            size_darg_value = "%d" % (original_mem / 2)
+            size_darg_value = "%d" % (original_mem // 2)
         elif mem_ref == "halfmore":
             size_darg_value = "%d" % int(original_mem * 1.5)
         elif mem_ref == "same":
@@ -80,7 +80,7 @@ def run(test, params, env):
 
     def is_xen_host():
         check_cmd = "ls /dev/kvm"
-        return utils.run(check_cmd, ignore_status=True).exit_status
+        return process.run(check_cmd, ignore_status=True, shell=True).exit_status
 
     def is_in_range(actual, expected, error_percent):
         deviation = 100 - (100 * (float(actual) / float(expected)))
@@ -111,14 +111,17 @@ def run(test, params, env):
     domarg = params.get("setmaxmem_domarg", "no")
     sizearg = params.get("setmaxmem_sizearg", "no")
     delta_per = params.get("setmaxmem_delta_per", "10")
+    readonly = "yes" == params.get("setmaxmem_readonly", "no")
+    expect_msg = params.get("setmaxmem_err_msg")
     vm_name = params.get("main_vm")
+    start_vm = "yes" == params.get("start_vm")
 
     # Gather environment parameters
     vm = env.get_vm(vm_name)
 
     # FIXME: KVM does not support --live currently.
     if (flags.count('live') or (flags.count('current') and vm.is_alive())):
-        raise error.TestNAError("KVM does not support --live.")
+        test.cancel("KVM does not support --live.")
 
     # Backup original XML
     original_vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
@@ -145,7 +148,7 @@ def run(test, params, env):
     # Argument pattern is complex, build with dargs
     dargs = {'flagstr': flags,
              'use_kilobytes': use_kilobytes,
-             'uri': uri, 'ignore_status': True, "debug": True}
+             'uri': uri, 'ignore_status': True, "debug": True, "readonly": readonly}
     dargs.update(make_domref(domarg, vm_ref, domid, vm_name, domuuid))
     dargs.update(make_sizeref(sizearg, mem_ref, original_dominfo_mem))
 
@@ -160,10 +163,13 @@ def run(test, params, env):
             cpu_xml = vmxml.cpu
             cpu_xml.remove_numa_cells()
             vmxml.cpu = cpu_xml
-        except:
+        except Exception:
             # The item doesn't exist
             pass
         vmxml.sync()
+        # sync will destroy the vm so need to start again
+        if start_vm:
+            vm.start()
 
         result = virsh.setmaxmem(**dargs)
         status = result.exit_status
@@ -176,7 +182,7 @@ def run(test, params, env):
             if vm.state() == "shut off":
                 try:
                     vm.start()
-                except virt_vm.VMStartError, detail:
+                except virt_vm.VMStartError as detail:
                     start_status = 1
                     logging.error("Start after VM's maxmem modified failed:%s",
                                   detail)
@@ -195,6 +201,9 @@ def run(test, params, env):
                               expected_mem, test_vmxml_mem, test_dominfo_mem)
 
         else:
+            if expect_msg:
+                libvirt.check_result(result, expect_msg.split(';'))
+
             if vm.state() == "paused":
                 vm.resume()
     finally:
@@ -203,7 +212,7 @@ def run(test, params, env):
     # Don't care about memory comparison on error test
     if status_error:
         if status is 0:
-            raise error.TestFail("Error test did not result in an error.")
+            test.fail("Error test did not result in an error.")
     else:
         vmxml_match = (test_vmxml_mem == expected_mem)
         if xen_host:
@@ -221,6 +230,6 @@ def run(test, params, env):
                 msg += "Max memory in dominfo's output is not matched. "
             if start_status:
                 msg += "Start after VM's max mem is modified failed."
-            raise error.TestFail(msg)
+            test.fail(msg)
 
     logging.info("Test end normally.")

@@ -4,15 +4,16 @@ import logging
 
 import aexpect
 
-from autotest.client.shared import error
+from avocado.core import exceptions
 
 from virttest import virsh
+from virttest import data_dir
 from virttest import remote
 from virttest import utils_libvirtd
 from virttest import utils_misc
 
 
-def reset_domain(vm, vm_state, needs_agent=False, guest_cpu_busy=False,
+def reset_domain(test, vm, vm_state, needs_agent=False, guest_cpu_busy=False,
                  password=None):
     """
     Setup guest agent in domain.
@@ -22,11 +23,13 @@ def reset_domain(vm, vm_state, needs_agent=False, guest_cpu_busy=False,
     """
     if vm.is_alive():
         vm.destroy()
+    if not needs_agent:
+        vm.prepare_guest_agent(start=False)
     if needs_agent:
         logging.debug("Attempting to prepare guest agent")
         start_ga = vm_state != 'shut off'
         vm.prepare_guest_agent(start=start_ga)
-    if not vm_state == "shut off" and needs_agent:
+    if not vm_state == "shut off":
         session = vm.wait_for_login()
         if guest_cpu_busy:
             shell_file = "/tmp/test.sh"
@@ -55,8 +58,8 @@ def reset_domain(vm, vm_state, needs_agent=False, guest_cpu_busy=False,
         # Execute "pm-suspend-hybrid" command directly will get Timeout error,
         # so here execute it in background, and wait for 3s manually
         if session.cmd_status("which pm-suspend-hybrid"):
-            raise error.TestNAError("Cannot execute this test for domain"
-                                    " doesn't have pm-suspend-hybrid command!")
+            test.cancel("Cannot execute this test for domain"
+                        " doesn't have pm-suspend-hybrid command!")
         session.cmd("pm-suspend-hybrid &")
         time.sleep(3)
 
@@ -91,25 +94,25 @@ def run(test, params, env):
         option = options.split()[0]
         test_cmd = "qemu-agent-command"
         if virsh.has_command_help_match(test_cmd, option) is None:
-            raise error.TestNAError("The current libvirt doesn't support"
-                                    " %s option for %s" % (option, test_cmd))
+            test.cancel("The current libvirt doesn't support"
+                        " %s option for %s" % (option, test_cmd))
     guest_cpu_busy = "yes" == params.get("guest_cpu_busy", "no")
     password = params.get("password", None)
     domuuid = vm.get_uuid()
     domid = ""
-    xml_file = os.path.join(test.tmpdir, "vm.xml")
+    xml_file = os.path.join(data_dir.get_tmp_dir(), "vm.xml")
     virsh.dumpxml(vm_name, extra="--inactive", to_file=xml_file)
     libvirtd_inst = utils_libvirtd.Libvirtd()
 
     # Prepare domain
     try:
-        reset_domain(vm, vm_state, needs_agent, guest_cpu_busy, password)
-    except error.TestNAError, details:
+        reset_domain(test, vm, vm_state, needs_agent, guest_cpu_busy, password)
+    except exceptions.TestCancel as details:
         reset_env(vm_name, xml_file)
-        raise error.TestNAError(details)
-    except Exception, details:
+        test.cancel(details)
+    except Exception as details:
         reset_env(vm_name, xml_file)
-        raise error.TestFail(details)
+        test.fail(details)
 
     if vm_state != "shut off":
         domid = vm.get_id()
@@ -124,14 +127,17 @@ def run(test, params, env):
         vm_ref = hex(int(domid))
 
     try:
-        # Check whether qemu-guest-agent is active in guest
-        session = vm.wait_for_login()
+        if vm_state == "running" and needs_agent:
+            # Check whether qemu-guest-agent is active in guest
+            session = vm.wait_for_login()
 
-        def verify_alive():
-            return utils_misc.get_guest_service_status(
+            def verify_alive():
+                return utils_misc.get_guest_service_status(
                     session, 'qemu-guest-agent') == 'active'
-        if not utils_misc.wait_for(verify_alive, 30):
-            test.error('Service "qemu-guest-agent" is not active')
+
+            if not utils_misc.wait_for(verify_alive, 30):
+                test.error('Service "qemu-guest-agent" is not active')
+
         # Run virsh command
         cmd_result = virsh.qemu_agent_command(vm_ref, cmd, options,
                                               ignore_status=True,
@@ -140,20 +146,20 @@ def run(test, params, env):
 
         # Check result
         if not libvirtd_inst.is_running():
-            raise error.TestFail("Libvirtd is not running after run command.")
+            test.fail("Libvirtd is not running after run command.")
         if status_error:
             if not status:
                 # Bug 853673
                 err_msg = "Expect fail but run successfully, please check Bug: "
                 err_msg += "https://bugzilla.redhat.com/show_bug.cgi?id=853673"
                 err_msg += " for more info"
-                raise error.TestFail(err_msg)
+                test.fail(err_msg)
             else:
                 logging.debug("Command failed as expected.")
         else:
             if status:
                 if cmd_result.stderr.count("not responding"):
-                    raise error.TestNAError(cmd_result.stderr.strip())
+                    test.cancel(cmd_result.stderr.strip())
                 if cmd.count("guest-shutdown") and\
                    cmd_result.stderr.count("Missing monitor reply object"):
                     err_msg = "Please check bug: "
@@ -165,7 +171,7 @@ def run(test, params, env):
                     err_msg += "https://bugzilla.redhat.com/show_bug.cgi?id="
                     err_msg += "1099060 for more info"
                     logging.error(err_msg)
-                raise error.TestFail("Expect succeed, but run fail.")
+                test.fail("Expect succeed, but run fail.")
     finally:
         # Cleanup
         reset_env(vm_name, xml_file)

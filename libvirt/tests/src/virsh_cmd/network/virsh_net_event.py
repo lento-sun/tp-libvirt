@@ -1,9 +1,7 @@
+import re
 import time
 import logging
-
 import aexpect
-
-from autotest.client.shared import error
 
 from virttest import virsh
 from virttest.utils_test import libvirt as utlv
@@ -24,6 +22,7 @@ def run(test, params, env):
     net_name = params.get("net_name")
     net_event_list = "yes" == params.get("net_event_list", "no")
     net_event_loop = "yes" == params.get("net_event_loop", "no")
+    net_event_timestamp = "yes" == params.get("net_event_timestamp", "no")
     net_event_name = params.get("net_event_name")
     net_event_timeout = params.get("net_event_timeout")
     net_event_amount = int(params.get("net_event_amount", 1))
@@ -39,7 +38,7 @@ def run(test, params, env):
         """
         Trigger network start/stop actions in event_number times
         """
-        i = event_amount / 2
+        i = event_amount // 2
         event_list = []
         try:
             while i > 0:
@@ -84,7 +83,10 @@ def run(test, params, env):
             logging.debug("Expected output: %s", match_str)
             logging.debug("Actual output: %s", output[index])
             if not output[index].count(match_str):
-                raise error.TestFail("Event received not match")
+                test.fail("Event received not match")
+            if net_event_timestamp:
+                if not re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", output[index]):
+                    test.fail("Can not get timestamp in output")
             index += 1
 
     try:
@@ -100,6 +102,8 @@ def run(test, params, env):
             net_event_option += " --list"
         if net_event_loop:
             net_event_option += " --loop"
+        if net_event_timestamp:
+            net_event_option += " --timestamp"
 
         if not status_error and not net_event_list:
             # Assemble the net-event command

@@ -19,7 +19,7 @@ def run(test, params, env):
     """
     Convert a remote vm to local libvirt(KVM).
     """
-    for v in params.itervalues():
+    for v in list(params.values()):
         if "V2V_EXAMPLE" in v:
             raise exceptions.TestSkipError("Please set real value for %s" % v)
 
@@ -117,8 +117,9 @@ def run(test, params, env):
         vm = env.create_vm("libvirt", "libvirt", vm_name, params, test.bindir)
         # Win10 is not supported by some cpu model,
         # need to modify to 'host-model'
-        if params.get('os_version') == 'win10':
-            logging.info('Set cpu mode to "host-model" for win10')
+        unsupport_list = ['win10', 'win2016', 'win2019']
+        if params.get('os_version') in unsupport_list:
+            logging.info('Set cpu mode to "host-model" for %s.', unsupport_list)
             vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
             cpu_xml = vm_xml.VMCPUXML()
             cpu_xml.mode = 'host-model'
@@ -137,8 +138,7 @@ def run(test, params, env):
     finally:
         vmcheck = utils_v2v.VMCheck(test, params, env)
         vmcheck.cleanup()
-        if hypervisor == "esx":
-            os.remove(vpx_pwd_file)
+        utils_v2v.cleanup_constant_files(params)
         if hypervisor == "xen":
             process.run("ssh-agent -k")
         # Clean libvirt VM

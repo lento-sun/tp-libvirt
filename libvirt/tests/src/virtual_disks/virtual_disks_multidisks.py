@@ -1,10 +1,12 @@
 import os
 import re
-import json
 import time
+import base64
+import json
 import logging
-import aexpect
 import platform
+import aexpect
+import locale
 
 from avocado.utils import process
 
@@ -14,14 +16,23 @@ from virttest import remote
 from virttest import nfs
 from virttest import utils_libvirtd
 from virttest import utils_misc
+from virttest import data_dir
+from virttest import utils_selinux
+from virttest import utils_package
+
 from virttest.utils_test import libvirt
 from virttest.utils_config import LibvirtQemuConfig
+from virttest.utils_config import LibvirtdConfig
+
 from virttest.libvirt_xml import vm_xml, xcepts
 from virttest.libvirt_xml.devices.disk import Disk
 from virttest.libvirt_xml.devices.input import Input
 from virttest.libvirt_xml.devices.hub import Hub
 from virttest.libvirt_xml.devices.controller import Controller
 from virttest.libvirt_xml.devices.address import Address
+from virttest.libvirt_xml import secret_xml
+from virttest.libvirt_xml import pool_xml
+from virttest.staging import lv_utils
 
 from provider import libvirt_version
 
@@ -44,6 +55,17 @@ def run(test, params, env):
     on_ppc = False
     if platform.platform().count('ppc64'):
         on_ppc = True
+    device_source = params.get("device_source", '/dev/sdb')
+    pvt = libvirt.PoolVolumeTest(test, params)
+    tmp_demo_img = "/tmp/demo.img"
+    se_obj = None
+
+    original_xml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
+    disk_devices = original_xml.get_devices('disk')
+    for disk in disk_devices:
+        if disk.device != 'disk':
+            virsh.detach_disk(vm_name, disk.target['dev'],
+                              extra='--config', debug=True)
 
     def check_disk_order(targets_name):
         """
@@ -62,34 +84,41 @@ def run(test, params, env):
                 slot_dict[disk.target['dev']] = int(
                     disk.address.attrs['slot'], base=16)
         # Disk's order on pci bus should keep the same with disk target name.
-        s_dev = sorted(slot_dict.keys())
-        s_slot = sorted(slot_dict.values())
+        s_dev = sorted(list(slot_dict.keys()))
+        s_slot = sorted(list(slot_dict.values()))
         for i in range(len(s_dev)):
             if s_dev[i] in targets_name and slot_dict[s_dev[i]] != s_slot[i]:
                 return False
         return True
 
-    def setup_nfs_disk(disk_name, disk_type, disk_format="raw"):
+    def setup_nfs_disk(disk_name, disk_type, disk_format="raw", is_disk=True):
         """
         Setup nfs disk.
+
+        :param disk_name: specified disk name.
+        :param disk_type: specified disk type
+        :param disk_format: specified disk format
+        :param is_disk: specified return value type
+        :return: Disk if is_disk is True, otherwise return mount_dir.
         """
-        mount_src = os.path.join(test.tmpdir, "nfs-export")
+        mount_src = os.path.join(data_dir.get_tmp_dir(), "nfs-export")
         if not os.path.exists(mount_src):
             os.mkdir(mount_src)
-        mount_dir = os.path.join(test.tmpdir, "nfs-mount")
+        mount_dir = os.path.join(data_dir.get_tmp_dir(), "nfs-mount")
 
         if disk_type in ["file", "floppy", "iso"]:
             disk_path = "%s/%s" % (mount_src, disk_name)
             device_source = libvirt.create_local_disk(disk_type, disk_path, "2",
                                                       disk_format=disk_format)
+            os.chmod(device_source, 0o777)
             #Format the disk.
             if disk_type in ["file", "floppy"]:
                 cmd = ("mkfs.ext3 -F %s && setsebool virt_use_nfs true"
                        % device_source)
                 if process.system(cmd, ignore_status=True, shell=True):
-                    test.skip("Format disk failed")
+                    test.cancel("Format disk failed")
 
-        nfs_params = {"nfs_mount_dir": mount_dir, "nfs_mount_options": "ro",
+        nfs_params = {"nfs_mount_dir": mount_dir, "nfs_mount_options": "rw",
                       "nfs_mount_src": mount_src, "setup_local_nfs": "yes",
                       "export_options": "rw,no_root_squash"}
 
@@ -100,10 +129,31 @@ def run(test, params, env):
 
         disk = {"disk_dev": nfs_obj, "format": "nfs", "source":
                 "%s/%s" % (mount_dir, os.path.split(device_source)[-1])}
+        if is_disk:
+            return disk
+        else:
+            return mount_dir
 
-        return disk
+    def download_iso(iso_url, target_iso="/var/lib/libvirt/images/boot.iso"):
+        """
+        Download given iso file url.
 
-    def prepare_disk(path, disk_format):
+        :param iso_url: downloaded iso url.
+        :param targetiso: target iso path
+        :return: downloaded target iso path if succeed, otherwise test fail.
+        """
+        if utils_package.package_install("wget"):
+            def _download():
+                download_cmd = ("wget %s -O %s" % (iso_url, target_iso))
+                if process.system(download_cmd, verbose=False, shell=True):
+                    test.error("Failed to download iso file")
+                return True
+            utils_misc.wait_for(_download, timeout=300)
+            return target_iso
+        else:
+            test.fail("Fail to install wget")
+
+    def prepare_disk(path, disk_format, disk_device, disk_device_type):
         """
         Prepare the disk for a given disk format.
         """
@@ -120,39 +170,108 @@ def run(test, params, env):
                 disk.update({"format": "scsi",
                              "source": disk_source})
             else:
-                test.skip("Get scsi disk failed")
+                test.cancel("Get scsi disk failed")
 
         elif disk_format in ["iso", "floppy"]:
-            disk_path = libvirt.create_local_disk(disk_format, path)
+            if boot_iso_url:
+                disk_path = download_iso(boot_iso_url)
+            else:
+                disk_path = libvirt.create_local_disk(disk_format, path)
             disk.update({"format": disk_format,
                          "source": disk_path})
         elif disk_format == "nfs":
-            nfs_disk_type = params.get("nfs_disk_type", None)
-            disk.update(setup_nfs_disk(os.path.split(path)[-1], nfs_disk_type))
+            if pool_type and pool_type == "netfs":
+                vol_name, vol_path = create_volume(pvt)
+                if disk_device_type == "volume":
+                    disk.update({"format": disk_format,
+                                 "source": {"attrs": {'pool': pool_name,
+                                                      'volume': vol_name,
+                                                      'mode': "host"}}})
+                else:
+                    disk.update({"format": disk_format,
+                                 "source": vol_path})
+                logging.debug("disk source is:%s", disk['source'])
+            else:
+                nfs_disk_type = params.get("nfs_disk_type", None)
+                disk.update(setup_nfs_disk(os.path.split(path)[-1], nfs_disk_type))
 
         elif disk_format == "iscsi":
             # Create iscsi device if needed.
             image_size = params.get("image_size", "2G")
+            if disk_device_type == "volume":
+                vol_name, vol_path = create_volume(pvt)
+                logging.debug("create volume:%s", vol_name)
+                mode = "host"
+                if params.get("pool_source_mode", None):
+                    mode = params.get("pool_source_mode")
+                disk.update({"format": disk_format,
+                             "source": {"attrs": {'pool': pool_name,
+                                                  'volume': vol_name,
+                                                  'mode': mode}}})
+                logging.debug("disk source is:%s", disk['source'])
+            elif disk_device_type == "network":
+                if auth_usage:
+                    global secret_uuid
+                    secret_uuid = create_auth_secret()
+                    # Setup iscsi target
+                    try:
+                        iscsi_target, lun_num = libvirt.setup_or_cleanup_iscsi(
+                            is_setup=True, is_login=False, image_size=image_size,
+                            chap_user=chap_user, chap_passwd=chap_passwd)
+                    except Exception as iscsi_ex:
+                        logging.debug("Failed to create iscsi lun: %s", str(iscsi_ex))
+                        libvirt.setup_or_cleanup_iscsi(is_setup=False)
+                    disk.update({"format": disk_format,
+                                 "source": {"attrs": {"protocol": "iscsi",
+                                                      "name": "%s/%s" % (iscsi_target, lun_num)},
+                                            "hosts": [{"name": '127.0.0.1', "port": '3260'}]}})
+                    logging.debug("disk source is:%s", disk['source'])
+            else:
+                device_source = libvirt.setup_or_cleanup_iscsi(
+                    is_setup=True, is_login=True, image_size=image_size,
+                    chap_user=chap_user, chap_passwd=chap_passwd)
+                device_source_backup = device_source
+                logging.debug("iscsi dev name: %s", device_source)
+
+                # Format the disk and make file system.
+                libvirt.mk_label(device_source)
+                libvirt.mk_part(device_source)
+                # Run partprobe to make the change take effect.
+                process.run("partprobe", ignore_status=True, shell=True)
+                libvirt.mkfs("%s1" % device_source, "ext3")
+                if disk_device == "lun" and disk_device_type == "block":
+                    device_source = device_source_backup
+                else:
+                    device_source += "1"
+                disk.update({"format": disk_format,
+                             "source": device_source})
+        elif disk_format == "lvm":
+            image_size = params.get("image_size", "2G")
             device_source = libvirt.setup_or_cleanup_iscsi(
                 is_setup=True, is_login=True, image_size=image_size)
             logging.debug("iscsi dev name: %s", device_source)
-
-            # Format the disk and make file system.
-            libvirt.mk_label(device_source)
-            libvirt.mk_part(device_source)
-            # Run partprobe to make the change take effect.
-            process.run("partprobe", ignore_status=True, shell=True)
-            libvirt.mkfs("%s1" % device_source, "ext3")
-            device_source += "1"
-            disk.update({"format": disk_format,
+            lv_utils.vg_create(vg_name, device_source)
+            device_source = libvirt.create_local_disk("lvm",
+                                                      size="10M",
+                                                      vgname=vg_name,
+                                                      lvname=lv_name)
+            logging.debug("New created volume: %s", lv_name)
+            disk.update({"format": 'lvm',
                          "source": device_source})
-        elif disk_format in ["raw", "qcow2", "vhdx"]:
+        elif disk_format in ["raw", "qcow2", "vhdx", "qed"]:
             disk_size = params.get("virt_disk_device_size", "1")
             device_source = libvirt.create_local_disk(
                 "file", path, disk_size, disk_format=disk_format)
             disk.update({"format": disk_format,
                          "source": device_source})
-
+            if file_mount_point_type:
+                for cmd in ("touch %s" % tmp_demo_img, "mount --bind %s %s" % (path, tmp_demo_img)):
+                    try:
+                        cmd_result = process.run(cmd, shell=True)
+                        cmd_result.stdout = cmd_result.stdout_text
+                        cmd_result.stderr = cmd_result.stderr_text
+                    except Exception as cmdError:
+                        os.remove(tmp_demo_img)
         return disk
 
     def check_disk_format(targets_name, targets_format):
@@ -183,7 +302,7 @@ def run(test, params, env):
             # Here the script needs wait for a while for the guest to
             # recognize the hotplugged disk on PPC
             add_sleep()
-            for i in range(len(devices)):
+            for i in list(range(len(devices))):
                 if devices[i] == "cdrom":
                     s, o = session.cmd_status_output(
                         "ls /dev/sr0 && mount /dev/sr0 /mnt &&"
@@ -198,6 +317,8 @@ def run(test, params, env):
                         target = "sda"
                     else:
                         target = targets_name[i]
+                    status, result = session.cmd_status_output(
+                        "cat /proc/partitions")
                     s, o = session.cmd_status_output(
                         "grep %s /proc/partitions" % target)
                     logging.info("Disk devices in VM:\n%s", o)
@@ -211,7 +332,7 @@ def run(test, params, env):
                         return False
             session.close()
             return True
-        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), e:
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
             logging.error(str(e))
             return False
 
@@ -245,9 +366,60 @@ def run(test, params, env):
                     return False
             session.close()
             return True
-        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), e:
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
             logging.error(str(e))
             return False
+
+    def check_vm_discard(target_name):
+        """
+        Check VM discard value.
+
+        :param target_name. Device target name.
+        """
+        logging.info("Checking VM discard...")
+        try:
+            session = vm.wait_for_login()
+            cmd = ("fdisk -l  /dev/{0} && mkfs.ext4 -F /dev/{0} && "
+                   "mkdir -p test && mount /dev/{0} test && "
+                   "dd if=/dev/zero of=test/file bs=1M count=300 && sync"
+                   .format(target_name))
+            status, output = session.cmd_status_output(cmd)
+            if status != 0:
+                session.close()
+                test.fail("Failed due to: %s" % output.strip())
+            discard_cmd = "cat /sys/bus/pseudo/drivers/scsi_debug/map"
+            cmd_result = process.run(discard_cmd, shell=True).stdout_text.strip()
+            # Get discard map list.
+            discard_map_list_before = len(cmd_result.split(','))
+
+            cmd = ("rm -rf file && sync && "
+                   "fstrim test")
+            status, output = session.cmd_status_output(cmd)
+            if status != 0:
+                session.close()
+                test.fail("Failed due to: %s", output)
+            session.close()
+            cmd_result = process.run(discard_cmd, shell=True).stdout_text.strip()
+            discard_map_list_after = len(cmd_result.split(','))
+            # After file is deleted,discard map number should be shorter.
+            if discard_map_list_after >= discard_map_list_before:
+                test.fail("discard map number doesn't reduce after file is deleted.")
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
+            logging.error(str(e))
+            test.error("Check Vm discard failed")
+
+    def check_vm_pci_bridge():
+        """
+        Check pci bridge in VM internal.
+        """
+        logging.debug("Checking VM pci bridge")
+        session = vm.wait_for_login()
+        status, output = session.cmd_status_output("lspci|grep 'PCI bridge'")
+        logging.debug("lspci information in VM: %s", output)
+        if status != 0:
+            session.close()
+            test.fail("Failed to check VM pci bridge")
+        session.close()
 
     def check_readonly(targets_name):
         """
@@ -272,7 +444,7 @@ def run(test, params, env):
                     return False
             session.close()
             return True
-        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), e:
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
             logging.error(str(e))
             return False
 
@@ -280,12 +452,12 @@ def run(test, params, env):
         """
         Check VM disk's bootorder option with snapshot.
 
-        :param disk_name. The target disk to be checked.
+        :param disk_name: the target disk to be checked.
         """
         logging.info("Checking diskorder option with snapshot...")
         snapshot1 = "s1"
         snapshot2 = "s2"
-        snapshot2_file = os.path.join(test.tmpdir, "s2")
+        snapshot2_file = os.path.join(data_dir.get_tmp_dir(), "s2")
         ret = virsh.snapshot_create(vm_name, "", **virsh_dargs)
         libvirt.check_exit_status(ret)
 
@@ -296,9 +468,9 @@ def run(test, params, env):
         ret = virsh.snapshot_dumpxml(vm_name, snapshot1)
         libvirt.check_exit_status(ret)
 
-        cmd = "echo \"%s\" | grep %s.%s" % (ret.stdout, disk_name, snapshot1)
+        cmd = "echo \"%s\" | grep %s.%s" % (ret.stdout.strip(), disk_name, snapshot1)
         if process.system(cmd, ignore_status=True, shell=True):
-            test.skip("Check snapshot disk failed")
+            test.cancel("Check snapshot disk failed")
 
         ret = virsh.snapshot_create_as(vm_name,
                                        "%s --memspec file=%s,snapshot=external"
@@ -310,7 +482,7 @@ def run(test, params, env):
         libvirt.check_exit_status(ret)
 
         cmd = ("echo \"%s\" | grep -A 16 %s.%s | grep \"boot order='%s'\""
-               % (ret.stdout, disk_name, snapshot2, bootorder))
+               % (ret.stdout.strip(), disk_name, snapshot2, bootorder))
         if process.system(cmd, ignore_status=True, shell=True):
             test.error("Check snapshot disk with bootorder failed")
 
@@ -343,11 +515,35 @@ def run(test, params, env):
         logging.debug("lines: %s", lines)
         if len(lines) != len(bootorders):
             return False
-        for i in range(len(bootorders)):
+        for i in list(range(len(bootorders))):
             if lines[i] != bootorders[i]:
                 return False
 
         return True
+
+    def check_boot_output():
+        """
+        Check console output.
+        """
+        # Get console output.
+        vm.serial_console.read_until_output_matches(
+            [r"Escape character is.*"], utils_misc.strip_console_codes)
+        output = vm.serial_console.get_stripped_output()
+        if 'Connected to domain' not in output:
+            test.fail("boot serial console doesn't find expected keyword:Connected to domain")
+
+    def check_disk_cache_mode(d_target, expect_disk_cache_mode):
+        """
+        Check VM disk's cache mode.
+
+        :param d_target: the target name of disk.
+        :param: expect_disk_cache_mode: the expected disk cache mode.
+        """
+        cache = vm_xml.VMXML.get_disk_attr(vm_name, d_target, "driver", "cache")
+        if not cache:
+            test.error("Can not get disk cache mode value")
+        if cache != expect_disk_cache_mode:
+            test.fail("Disk cache mode:%s is not expected:%s " % (cache, expect_disk_cache_mode))
 
     def check_disk_save_restore(save_file, device_targets,
                                 startup_policy):
@@ -382,7 +578,7 @@ def run(test, params, env):
                 test.error("Failed to read/write disk in VM:"
                            " %s" % output)
             session.close()
-        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), detail:
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as detail:
             test.error(str(detail))
 
     def check_dom_iothread():
@@ -393,8 +589,8 @@ def run(test, params, env):
                                          '{"execute": "query-iothreads"}',
                                          "--pretty")
         libvirt.check_exit_status(ret)
-        logging.debug("Domain iothreads: %s", ret.stdout)
-        iothreads_ret = json.loads(ret.stdout)
+        logging.debug("Domain iothreads: %s", ret.stdout.strip())
+        iothreads_ret = json.loads(ret.stdout.strip())
         if len(iothreads_ret['return']) != int(dom_iothreads):
             test.fail("Failed to check domain iothreads")
 
@@ -438,8 +634,162 @@ def run(test, params, env):
         custom_disk.driver = driver_dict
         return custom_disk
 
+    def clean_up_lvm():
+        """Clean up lvm. """
+        libvirt.delete_local_disk("lvm", vgname=vg_name, lvname=lv_name)
+        lv_utils.vg_remove(vg_name)
+        process.system("pvremove %s" % device_source, ignore_status=True, shell=True)
+        process.system("rm -rf /dev/%s" % vg_name, ignore_status=True, shell=True)
+        libvirt.setup_or_cleanup_iscsi(False)
+
+    def virt_xml_validate(xml_file, validate_error=False):
+        """Validate xml file. """
+        exit_status = process.system("/bin/virt-xml-validate %s" % xml_file, ignore_status=True, shell=True)
+        if not validate_error:
+            if exit_status != 0:
+                test.fail("Run command expect succeed,but failed")
+            else:
+                logging.debug("Run command succeed")
+        elif validate_error and exit_status == 0:
+            test.fail("Run command expect fail, but run "
+                      "successfully.")
+
+    def create_auth_secret():
+        """Create auth secret."""
+        sec_xml = secret_xml.SecretXML("no", "yes")
+        sec_xml.description = "iSCSI secret"
+        sec_xml.auth_type = auth_type
+        sec_xml.auth_username = chap_user
+        sec_xml.usage = secret_usage_type
+        sec_xml.target = secret_usage_target
+        sec_xml.xmltreefile.write()
+
+        ret = virsh.secret_define(sec_xml.xml)
+        libvirt.check_exit_status(ret)
+
+        secet_uuid_value = re.findall(r".+\S+(\ +\S+)\ +.+\S+",
+                                      ret.stdout.strip())[0].lstrip()
+        logging.debug("Secret uuid %s", secet_uuid_value)
+        if not secet_uuid_value:
+            test.error("Failed to get secret uuid")
+
+        # Set secret value
+        encoding = locale.getpreferredencoding()
+        secret_string = base64.b64encode(chap_passwd.encode(encoding)).decode(encoding)
+        ret = virsh.secret_set_value(secet_uuid_value, secret_string,
+                                     **virsh_dargs)
+        libvirt.check_exit_status(ret)
+        return secet_uuid_value
+
+    def create_iscsi_pool():
+        """
+        Setup iSCSI target,and create one iSCSI pool.
+        """
+        libvirt.setup_or_cleanup_iscsi(is_setup=False)
+        iscsi_target, lun_num = libvirt.setup_or_cleanup_iscsi(is_setup=True,
+                                                               is_login=False,
+                                                               image_size='1G',
+                                                               chap_user="",
+                                                               chap_passwd="",
+                                                               portal_ip=disk_src_host)
+        # Define an iSCSI pool xml to create it
+        pool_src_xml = pool_xml.SourceXML()
+        pool_src_xml.host_name = pool_src_host
+        pool_src_xml.device_path = iscsi_target
+        poolxml = pool_xml.PoolXML(pool_type=pool_type)
+        poolxml.name = pool_name
+        poolxml.set_source(pool_src_xml)
+        poolxml.target_path = "/dev/disk/by-path"
+
+        # Create iSCSI pool.
+        pool_result = virsh.pool_state_dict()
+        if pool_name and pool_name in pool_result:
+            virsh.pool_destroy(pool_name, **virsh_dargs)
+        cmd_result = virsh.pool_create(poolxml.xml, **virsh_dargs)
+        libvirt.check_exit_status(cmd_result)
+
+    def create_nfs_pool():
+        """
+        Setup nfs pool.
+        """
+        # Create nfs pool.
+        pool_result = virsh.pool_state_dict()
+        if pool_name and pool_name in pool_result:
+            virsh.pool_destroy(pool_name, **virsh_dargs)
+        pool_target = "admin"
+        pvt.pre_pool(pool_name, pool_type, pool_target, emulated_image, image_size="40M")
+
+    def create_volume(pvt):
+        """
+        Create iSCSI volume.
+
+        :params pvt: PoolVolumeTest object
+        """
+        try:
+            if pool_type == "iscsi":
+                create_iscsi_pool()
+            elif pool_type == "netfs":
+                create_nfs_pool()
+                pvt.pre_vol(vol_name=vol_name, vol_format=vol_format,
+                            capacity=capacity, allocation=None,
+                            pool_name=pool_name)
+        except Exception as pool_exception:
+            pvt.cleanup_pool(pool_name, pool_type, pool_target,
+                             emulated_image, **virsh_dargs)
+            test.error("Error occurred when prepare pool xml with message:%s\n",
+                       str(pool_exception))
+
+        def get_vol():
+            """Get the volume info"""
+            # Refresh the pool
+            cmd_result = virsh.pool_refresh(pool_name)
+            libvirt.check_exit_status(cmd_result)
+            # Get volume name
+            cmd_result = virsh.vol_list(pool_name, **virsh_dargs)
+            libvirt.check_exit_status(cmd_result)
+            vol_list = []
+            vol_list = re.findall(r"(\S+)\ +(\S+)",
+                                  str(cmd_result.stdout.strip()))
+            if len(vol_list) > 1:
+                return vol_list[1]
+            else:
+                return None
+
+        # Wait for a while so that we can get the volume info
+        vol_info = utils_misc.wait_for(get_vol, 10)
+        if vol_info:
+            tmp_vol_name, tmp_vol_path = vol_info
+        else:
+            test.error("Failed to get volume info")
+        process.run('qemu-img create -f qcow2 %s %s' % (tmp_vol_path, '100M'),
+                    shell=True)
+        return vol_info
+
+    def config_libvirtd_log():
+        """ configure libvirtd log level"""
+        log_outputs = "1:file:%s" % log_config_path
+        libvirtd_config.log_outputs = log_outputs
+        libvirtd_config.log_filters = "1:json 1:libvirt 1:qemu 1:monitor 3:remote 4:event"
+        utils_libvirtd.libvirtd_restart()
+
+    def check_info_in_libvird_log_file(matchedMsg=None):
+        """
+        Check if information can be found in libvirtd log.
+
+        :params matchedMsg: expected matched messages
+        """
+        # Check libvirtd log file.
+        libvirtd_log_file = log_config_path
+        if not os.path.exists(libvirtd_log_file):
+            test.fail("Expected VM log file: %s not exists" % libvirtd_log_file)
+        cmd = ("grep -nr '%s' %s" % (matchedMsg, libvirtd_log_file))
+        if process.run(cmd, ignore_status=True, shell=True).exit_status:
+            test.fail("Failed to get expected messages from log file: %s."
+                      % libvirtd_log_file)
+
     status_error = "yes" == params.get("status_error", "no")
     define_error = "yes" == params.get("define_error", "no")
+    validate_error = "yes" == params.get("validate_error", "no")
     dom_iothreads = params.get("dom_iothreads")
 
     # Disk specific attributes.
@@ -461,8 +811,8 @@ def run(test, params, env):
     bootdisk_target = params.get("virt_disk_bootdisk_target", "vda")
     bootdisk_bus = params.get("virt_disk_bootdisk_bus", "virtio")
     bootdisk_driver = params.get("virt_disk_bootdisk_driver", "")
-    serial = params.get("virt_disk_serial", "")
-    wwn = params.get("virt_disk_wwn", "")
+    serial = params.get("virt_disk_serial", "").split()
+    wwn = params.get("virt_disk_wwn", "").split()
     vendor = params.get("virt_disk_vendor", "")
     product = params.get("virt_disk_product", "")
     add_disk_driver = params.get("add_disk_driver")
@@ -471,6 +821,7 @@ def run(test, params, env):
     snapshot_option = params.get("snapshot_option", "")
     snapshot_error = "yes" == params.get("snapshot_error", "no")
     add_usb_device = "yes" == params.get("add_usb_device", "no")
+    duplicate_target = params.get("virt_disk_duplicate_target", "no")
     hotplug = "yes" == params.get(
         "virt_disk_device_hotplug", "no")
     device_at_dt_disk = "yes" == params.get("virt_disk_at_dt_disk", "no")
@@ -480,18 +831,27 @@ def run(test, params, env):
         "virtio_scsi_controller", "no")
     virt_disk_with_duplicate_scsi_controller_index = "yes" == params.get(
         "virt_disk_with_duplicate_scsi_controller_index", "no")
+    multi_ide_controller = "yes" == params.get(
+        "disk_virtio_multi_ide_controller", "no")
     virtio_scsi_controller_driver = params.get(
         "virtio_scsi_controller_driver", "")
+    virtio_scsi_controller_addr = params.get(
+        "virtio_scsi_controller_addr", "")
     source_path = "yes" == params.get(
         "virt_disk_device_source_path", "yes")
-    check_patitions = "yes" == params.get(
+    check_partitions = "yes" == params.get(
         "virt_disk_check_partitions", "yes")
-    check_patitions_hotunplug = "yes" == params.get(
+    check_discard = "yes" == params.get(
+        "virt_disk_check_discard", "no")
+    check_pci_bridge = "yes" == params.get(
+        "virt_disk_check_pci_bridge", "no")
+    check_partitions_hotunplug = "yes" == params.get(
         "virt_disk_check_partitions_hotunplug", "yes")
     test_slots_order = "yes" == params.get(
         "virt_disk_device_test_order", "no")
-    test_disks_format = "yes" == params.get(
-        "virt_disk_device_test_format", "no")
+    # allow_disk_format_probing configuration was removed since libvirt-4.5
+    test_disks_format = False if libvirt_version.version_compare(4, 5, 0) \
+        else "yes" == params.get("virt_disk_device_test_format", "no")
     test_block_size = "yes" == params.get(
         "virt_disk_device_test_block_size", "no")
     test_file_img_on_disk = "yes" == params.get(
@@ -522,11 +882,79 @@ def run(test, params, env):
         "disk_cdrom_update_boot_order", "no")
     disk_floppy_update_boot_order = "yes" == params.get(
         "disk_floppy_update_boot_order", "no")
+    vg_name = params.get("virt_disk_vg_name", "vg_test_0")
+    lv_name = params.get("virt_disk_lv_name", "lv_test_0")
+    disk_transient = "yes" == params.get("disk_transient", "no")
+    virt_xml_validate_test = "yes" == params.get("virt_xml_validate_test", "no")
+    test_attach_device_iteration = "yes" == params.get("test_attach_device_iteration", "no")
+    attach_device_as_scsi_lun = "yes" == params.get("attach_device_as_scsi_lun", "no")
+    attach_ccw_address_at_dt_disk = "yes" == params.get("disk_attach_ccw_address_at_dt_disk", "no")
+
+    # Chap auth parameters.
+    chap_user = params.get("iscsi_user", "")
+    chap_passwd = params.get("iscsi_password", "")
+    auth_usage = "yes" == params.get("auth_usage", "")
+    auth_type = params.get("auth_type")
+    secret_usage_target = params.get("secret_usage_target")
+    secret_usage_type = params.get("secret_usage_type")
+
+    # Storage pool and disk related parameters.S
+    pool_name = params.get("pool_name", "iscsi_pool")
+    pool_type = params.get("pool_type")
+    pool_target = params.get("pool_target", "/dev/disk/by-path")
+    pool_src_host = params.get("pool_source_host", "127.0.0.1")
+    disk_src_host = params.get("disk_source_host", "127.0.0.1")
+    emulated_image = params.get("emulated_image", "emulated-iscsi")
+    vol_name = params.get("volume_name")
+    capacity = params.get("volume_size", "4096")
+    vol_format = params.get("volume_format")
+    file_mount_point_type = "yes" == params.get("file_mount_point_type", "no")
+
+    # Check disk cache mode.
+    check_disk_cache = "yes" == params.get("check_disk_cache_mode", "no")
+    disk_cache_mode = params.get("disk_cache_mode")
+
+    # Minimal VM xml,special case.
+    test_minimal_xml = "yes" == params.get("test_minimal_xml", "no")
+
+    # Check special characters xml.
+    test_special_characters_xml = "yes" == params.get("test_special_characters_xml", "no")
+
+    # Backup selinux_mode and virt_use_nfs status
+    virt_use_nfs_off = "yes" == params.get("virt_use_nfs_off", "no")
+    if virt_use_nfs_off:
+        selinux_mode = utils_selinux.get_status()
+        logging.info("Enable virt NFS SELinux boolean")
+        result = process.run("getsebool virt_use_nfs", shell=True, ignore_status=True)
+        if result.exit_status:
+            test.fail("Failed to get virt_use_nfs value")
+        backup_virt_use_nfs_status = result.stdout_text.strip().split("-->")[1].strip()
+        logging.debug("debug virt_use:%s", backup_virt_use_nfs_status)
+
+    virt_disk_with_boot_nfs_pool = "yes" == params.get("virt_disk_with_boot_nfs_pool", "no")
+    iso_url = ("https://dl.fedoraproject.org/pub/fedora/linux/releases",
+               "/27/Everything/x86_64/os/images/boot.iso")
+    default_iso_url = ''.join(iso_url)
+    boot_iso_url = params.get("boot_iso_url")
+    if virt_disk_with_boot_nfs_pool and 'EXAMPLE_BOOT_ISO_URL' in boot_iso_url:
+        boot_iso_url = default_iso_url
+
+    # Restart libvirtd.
+    restart_libvird = "yes" == params.get("restart_libvird", "no")
+    virtio_disk_hot_unplug_event_watch = "yes" == params.get("virtio_disk_hot_unplug_event_watch", "no")
+
+    # Configure libvirtd log level and path.
+    log_file = params.get("log_file", "libvirtd.log")
+    log_config_path = os.path.join(data_dir.get_tmp_dir(), log_file)
+    libvirtd_config = LibvirtdConfig()
+
+    if virtio_disk_hot_unplug_event_watch:
+        config_libvirtd_log()
 
     if dom_iothreads:
         if not libvirt_version.version_compare(1, 2, 8):
-            test.skip("iothreads not supported for"
-                      " this libvirt version")
+            test.cancel("iothreads not supported for"
+                        " this libvirt version")
 
     if test_block_size:
         logical_block_size = params.get("logical_block_size")
@@ -553,10 +981,77 @@ def run(test, params, env):
     # Back up xml file.
     vmxml_backup = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
 
+    # For minimal VM xml,it need reconstruct one.
+    if test_minimal_xml:
+        minimal_vm_xml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
+        first_disk = vm.get_first_disk_devices()
+        first_disk_source = first_disk['source']
+        minimal_vm_xml_file = minimal_vm_xml.xml
+        minimal_xml_content = """<domain type='kvm'>
+        <name>%s</name>
+        <memory unit='KiB'>1048576</memory>
+        <currentMemory unit='KiB'>1048576</currentMemory>
+        <vcpu placement='static'>1</vcpu>
+        <os>
+          <type arch='x86_64' machine='pc'>hvm</type>
+          <boot dev='hd'/>
+        </os>
+        <devices>
+          <emulator>/usr/libexec/qemu-kvm</emulator>
+          <disk type='file' device='disk'>
+            <driver name='qemu' type='qcow2' cache='none'/>
+            <source file='%s'/>
+            <target dev='vda' bus='virtio'/>
+          </disk>
+        </devices>
+        </domain>""" % (vm_name, first_disk_source)
+        with open(minimal_vm_xml_file, 'w') as xml_file:
+            xml_file.seek(0)
+            xml_file.truncate()
+            xml_file.write(minimal_xml_content)
+        vm.undefine()
+        if virsh.define(minimal_vm_xml_file).exit_status:
+            test.cancel("can't create the domain")
+
+    # For special characters VM xml,and disk image file name.
+    if test_special_characters_xml:
+        first_disk = vm.get_first_disk_devices()
+        first_disk_source = first_disk['source']
+        first_disk_source_rename = "%s.rhel7.4\.img**" % first_disk_source
+        try:
+            # Rename disk file image to another name with special characters.
+            os.rename(first_disk_source, first_disk_source_rename)
+            # Update disk source file.
+            params.update({'disk_source_name': first_disk_source_rename,
+                           'disk_type': 'file',
+                           'disk_src_protocol': 'file'})
+            libvirt.set_vm_disk(vm, params)
+            vm.wait_for_login().close()
+            if vm.is_alive():
+                vm.destroy(gracefully=False)
+
+            # Rename VM xml file to another name with special characters.
+            special_vm_xml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
+            special_vm_xml_file = special_vm_xml.xml
+            special_vm_xml_file_rename = "%s.dump" % special_vm_xml_file
+            vm.undefine()
+            os.rename(special_vm_xml_file, special_vm_xml_file_rename)
+
+            # Validate xml file.
+            virt_xml_validate(special_vm_xml_file_rename)
+            if virsh.define(special_vm_xml_file_rename).exit_status:
+                test.cancel("can't create the domain")
+        finally:
+            if vm.is_alive():
+                vm.destroy(gracefully=False)
+            os.rename(first_disk_source_rename, first_disk_source)
+            vmxml_backup.sync("--snapshots-metadata")
+        return
+
     # Get device path.
-    device_source_path = ""
+    device_source_path = params.get("device_source_path", "")
     if source_path:
-        device_source_path = test.virtdir
+        device_source_path = data_dir.get_tmp_dir()
 
     # Prepare test environment.
     qemu_config = LibvirtQemuConfig()
@@ -567,7 +1062,7 @@ def run(test, params, env):
     # Create virtual device file.
     disks = []
     try:
-        for i in range(len(device_source_names)):
+        for i in list(range(len(device_source_names))):
             if test_disk_type_dir:
                 # If we testing disk type dir option,
                 # it needn't to create disk image
@@ -576,22 +1071,25 @@ def run(test, params, env):
             else:
                 path = "%s/%s.%s" % (device_source_path,
                                      device_source_names[i], device_formats[i])
-                disk = prepare_disk(path, device_formats[i])
+                disk = prepare_disk(path, device_formats[i], devices[i], device_types[i])
                 if disk:
                     disks.append(disk)
 
-    except Exception, e:
+    except Exception as e:
         logging.error(repr(e))
         for img in disks:
-            if img.has_key("disk_dev"):
+            if "disk_dev" in img:
                 if img["format"] == "nfs":
                     img["disk_dev"].cleanup()
             else:
                 if img["format"] == "iscsi":
                     libvirt.setup_or_cleanup_iscsi(is_setup=False)
                 if img["format"] not in ["dir", "scsi"]:
+                    logging.debug("current source:%s", img["source"])
                     os.remove(img["source"])
-        test.skip("Creating disk failed")
+                if img["format"] == "lvm":
+                    clean_up_lvm()
+        test.cancel("Creating disk failed")
 
     # Build disks xml.
     disks_xml = []
@@ -599,7 +1097,7 @@ def run(test, params, env):
     disks_img = []
     vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
     try:
-        for i in range(len(disks)):
+        for i in list(range(len(disks))):
             disk_xml = Disk(type_name=device_types[i])
             # If we are testing image file on iscsi disk,
             # mount the disk and then create the image.
@@ -608,7 +1106,7 @@ def run(test, params, env):
                 if process.system("mkdir -p %s && mount %s %s"
                                   % (mount_path, disks[i]["source"],
                                      mount_path), ignore_status=True, shell=True):
-                    test.skip("Prepare disk failed")
+                    test.cancel("Prepare disk failed")
                 disk_path = "%s/%s.qcow2" % (mount_path, device_source_names[i])
                 disk_source = libvirt.create_local_disk("file", disk_path, "1",
                                                         disk_format="qcow2")
@@ -629,8 +1127,12 @@ def run(test, params, env):
                 source_dict = {dev_attrs: disk_source}
                 if len(startup_policy) > i:
                     source_dict.update({"startupPolicy": startup_policy[i]})
-                disk_xml.source = disk_xml.new_disk_source(
-                    **{"attrs": source_dict})
+                if auth_usage or pool_type == "iscsi":
+                    disk_xml.source = disk_xml.new_disk_source(
+                        **disk_source)
+                else:
+                    disk_xml.source = disk_xml.new_disk_source(
+                        **{"attrs": source_dict})
 
             if len(device_bootorder) > i:
                 disk_xml.boot = device_bootorder[i]
@@ -639,10 +1141,10 @@ def run(test, params, env):
                 disk_xml.blockio = {"logical_block_size": logical_block_size,
                                     "physical_block_size": physical_block_size}
 
-            if wwn != "":
-                disk_xml.wwn = wwn
-            if serial != "":
-                disk_xml.serial = serial
+            if len(wwn) != 0 and wwn[i] != "":
+                disk_xml.wwn = wwn[i]
+            if len(serial) != 0 and serial[i] != "":
+                disk_xml.serial = serial[i]
             if vendor != "":
                 disk_xml.vendor = vendor
             if product != "":
@@ -652,6 +1154,9 @@ def run(test, params, env):
             if len(device_readonly) > i:
                 disk_xml.readonly = "yes" == device_readonly[i]
 
+            if disk_transient:
+                disk_xml.transient = "yes"
+
             # Add driver options from parameters
             driver_dict = {"name": "qemu"}
             if len(driver_options) > i:
@@ -660,6 +1165,13 @@ def run(test, params, env):
                         d = driver_option.split('=')
                         driver_dict.update({d[0].strip(): d[1].strip()})
             disk_xml.driver = driver_dict
+
+            # Add iSCSI authentication information.
+            if auth_usage:
+                auth_dict = {"auth_user": chap_user,
+                             "secret_type": secret_usage_type,
+                             "secret_usage": secret_usage_target}
+                disk_xml.auth = disk_xml.new_auth(**auth_dict)
 
             # Add disk address from parameters.
             if len(device_address) > i:
@@ -730,11 +1242,42 @@ def run(test, params, env):
             vmxml.devices = xml_devices
             vmxml.define()
 
+        # Virt_disk_with_boot_nfs_pool check.
+        if virt_disk_with_boot_nfs_pool:
+            boot_iso_url = default_iso_url
+            xml_devices = vmxml.devices
+            first_disk_device = xml_devices.by_device_tag("disk")[0]
+            vmxml.del_device(first_disk_device)
+            if bootorder != "":
+                osxml = vm_xml.VMOSXML()
+                osxml.type = vmxml.os.type
+                osxml.arch = vmxml.os.arch
+                osxml.machine = vmxml.os.machine
+                osxml.boots = ['cdrom']
+                if test_boot_console:
+                    osxml.loader = params.get("disk_boot_seabios", "")
+                    osxml.bios_useserial = "yes"
+                    osxml.bios_reboot_timeout = "-1"
+                del vmxml.os
+                vmxml.os = osxml
+            vmxml.sync()
+            vm.start()
+            check_boot_output()
+            if vm.is_alive():
+                vm.destroy(gracefully=False)
+            return
+
         # Add virtio_scsi controller.
         if virtio_scsi_controller:
             scsi_controller = Controller("controller")
             scsi_controller.type = "scsi"
+            ctl_type = params.get("virtio_scsi_controller_type")
+            if ctl_type:
+                scsi_controller.type = ctl_type
             scsi_controller.index = "0"
+            ctl_index = params.get("virtio_scsi_controller_index")
+            if ctl_index:
+                scsi_controller.index = ctl_index
             ctl_model = params.get("virtio_scsi_controller_model")
             if ctl_model:
                 scsi_controller.model = ctl_model
@@ -745,7 +1288,17 @@ def run(test, params, env):
                         d = driver_option.split('=')
                         driver_dict.update({d[0].strip(): d[1].strip()})
                 scsi_controller.driver = driver_dict
-            vmxml.del_controller("scsi")
+            if virtio_scsi_controller_addr != "":
+                addr_dict = {}
+                for addr_option in virtio_scsi_controller_addr.split(','):
+                    if addr_option != "":
+                        addr = addr_option.split('=')
+                        addr_dict.update({addr[0].strip(): addr[1].strip()})
+                scsi_controller.address = scsi_controller.new_controller_address(attrs=addr_dict)
+            if ctl_type:
+                vmxml.del_controller(ctl_type)
+            else:
+                vmxml.del_controller("scsi")
             vmxml.add_device(scsi_controller)
 
         # Create second disk,and attach to VM with the same index controller.
@@ -767,6 +1320,15 @@ def run(test, params, env):
                 libvirt.check_exit_status(ret)
                 vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
 
+        # Create second controller,and add it to vmxml.
+        if multi_ide_controller:
+            for i in list(range(1, 2)):
+                ide_controller = Controller("controller")
+                ctl_type = params.get("virtio_scsi_controller_type")
+                ide_controller.type = ctl_type
+                ide_controller.index = str(i)
+                vmxml.add_device(ide_controller)
+
         # Test usb devices.
         usb_devices = {}
         if add_usb_device:
@@ -777,9 +1339,9 @@ def run(test, params, env):
                     vmxml.del_device(ctrl)
 
             inputs = vmxml.get_devices(device_type="input")
-            for input in inputs:
-                if input.type_name == "tablet":
-                    vmxml.del_device(input)
+            for input_device in inputs:
+                if input_device.type_name == "tablet":
+                    vmxml.del_device(input_device)
 
             hubs = vmxml.get_devices(device_type="hub")
             for hub in hubs:
@@ -821,8 +1383,18 @@ def run(test, params, env):
                                                % snapshot_option)
                 libvirt.check_exit_status(ret, snapshot_error)
 
+        if virt_use_nfs_off:
+            utils_selinux.set_status("enforcing")
+            result = process.run("setsebool virt_use_nfs off", shell=True, ignore_status=True)
+            if result.exit_status:
+                logging.info("Failed to set virt_use_nfs off")
+
+        vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
         # Start the VM.
+        logging.debug('wait for a while')
         vm.start()
+        if test_minimal_xml:
+            return
         vm.wait_for_login()
         if status_error:
             test.fail("VM started unexpectedly")
@@ -844,21 +1416,25 @@ def run(test, params, env):
             Firstly,create another disk for a given path.
             Update previous disk with newly created disk and modified boot order.
             Eject disk finally.
+
             :param disk_type: the type of disk.
             :param disk_path: the path of disk.
             :param error_msg: the expected error message.
             """
-
             addtional_disk = create_addtional_disk(disk_type, disk_path, device_formats[0], device_types[0],
                                                    devices[0], device_targets[0],
                                                    device_bus[0])
             addtional_disk.boot = '2'
             addtional_disk.readonly = 'True'
             # Update disk cdrom/floppy with modified boot order,it expect fail.
-            ret = virsh.update_device(vm_name, addtional_disk.xml, debug=True)
-            if ret.exit_status == 0 or not ret.stderr.count("Operation not supported: " +
-                                                            "cannot modify field 'boot order' of the disk"):
-                test.fail(error_msg)
+            flopy_error_msg = params.get('flopy_error_msg', "")
+            cdrom_error_msg = params.get('cdrom_error_msg', "")
+            try:
+                stderr_output = virsh.update_device(vm_name, addtional_disk.xml, debug=True).stderr_text
+            except Exception as update_device_exception:
+                if all(not stderr_output.count(flopy_error_msg),
+                       not stderr_output.count(cdrom_error_msg)):
+                    test.fail(error_msg)
             # Force eject cdrom or floppy, it expect succeed.
             eject_disk = Disk(type_name='block')
             eject_disk.target = {"dev": device_targets[0], "bus": device_bus[0]}
@@ -867,28 +1443,43 @@ def run(test, params, env):
             libvirt.check_exit_status(ret)
 
         if disk_cdrom_update_boot_order:
-            check_patitions = False
+            check_partitions = False
             disk_path = params.get('iso_path', "")
             test_device_update_boot_order("iso", disk_path, 'cdrom update error happen...')
 
         if disk_floppy_update_boot_order:
-            check_patitions = False
+            check_partitions = False
             disk_path = params.get('floppy_path', "")
             test_device_update_boot_order("floppy", disk_path, 'floppy update error happen...')
 
         # Hotplug the disks.
         if device_at_dt_disk:
-            for i in range(len(disks)):
+            for i in list(range(len(disks))):
                 attach_option = ""
                 if len(device_attach_option) > i:
                     attach_option = device_attach_option[i]
+                logging.debug('debug xml output:')
+                dump_vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
+                logging.debug('vm:%s', dump_vmxml)
                 ret = virsh.attach_disk(vm_name, disks[i]["source"],
                                         device_targets[i],
-                                        attach_option)
-                libvirt.check_exit_status(ret)
-
+                                        attach_option, debug=True)
+                disk_attach_error = False
+                if len(device_attach_error) > i:
+                    disk_attach_error = "yes" == device_attach_error[i]
+                libvirt.check_exit_status(ret, disk_attach_error)
+            if attach_ccw_address_at_dt_disk:
+                attach_option = device_attach_option[0].replace('--live', '--config')
+                ret = virsh.attach_disk(vm_name, disks[0]["source"],
+                                        device_targets[0],
+                                        attach_option, debug=True)
+                disk_attach_error = False
+                libvirt.check_exit_status(ret, disk_attach_error)
+                vm.destroy(gracefully=False)
+                status_error = True
+                vm.start()
         elif hotplug:
-            for i in range(len(disks_xml)):
+            for i in list(range(len(disks_xml))):
                 disks_xml[i].xmltreefile.write()
                 attach_option = ""
                 if len(device_attach_option) > i:
@@ -909,13 +1500,32 @@ def run(test, params, env):
                                           flagstr=attach_option, debug=True)
                 libvirt.check_exit_status(ret, attach_error)
 
+            if attach_device_as_scsi_lun:
+                attach_options = ['--live', '--current', '--config', '--persistent']
+                attach_error = True
+                for counter in range(2):
+                    if counter > 0:
+                        if vm.is_alive():
+                            vm.destroy(gracefully=False)
+                    for attach_option in attach_options:
+                        ret = virsh.attach_device(vm_name, disks_xml[0].xml,
+                                                  flagstr=attach_option, debug=False)
+                        libvirt.check_exit_status(ret, attach_error)
+                return
+
     except virt_vm.VMStartError as details:
         if not status_error:
             test.fail('VM failed to start:\n%s' % details)
     except xcepts.LibvirtXMLError as xml_error:
         if not define_error:
             test.fail("Failed to define VM:\n%s" % xml_error)
+        # Validate VM xml.
+        if virt_xml_validate_test:
+            virt_xml_validate(vmxml.xml, validate_error)
     else:
+        # Validate VM xml.
+        if virt_xml_validate_test:
+            virt_xml_validate(vmxml.xml, validate_error)
         # VM is started, perform the tests.
         if test_slots_order:
             if not check_disk_order(device_targets):
@@ -973,10 +1583,13 @@ def run(test, params, env):
             if iothread:
                 cmd += " | grep iothread=iothread%s" % iothread
 
-            if serial != "":
-                cmd += " | grep serial=%s" % serial
-            if wwn != "":
-                cmd += " | grep -E \"wwn=(0x)?%s\"" % wwn
+            if len(serial) != 0 and serial[0] != "":
+                cmd += " | grep serial=%s" % serial[0]
+            if len(wwn) != 0 and wwn[0] != "":
+                if len(wwn) > 1:
+                    cmd += " | grep -E \"wwn=(0x)?%s.*wwn=(0x)?%s\"" % (wwn[0], wwn[1])
+                else:
+                    cmd += " | grep -E \"wwn=(0x)?%s\"" % wwn[0]
             if vendor != "":
                 cmd += " | grep vendor=%s" % vendor
             if product != "":
@@ -1025,7 +1638,7 @@ def run(test, params, env):
 
         # Check the disk bootorder.
         if test_disk_bootorder:
-            for i in range(len(device_targets)):
+            for i in list(range(len(device_targets))):
                 if len(device_attach_error) > i:
                     if device_attach_error[i] == "yes":
                         continue
@@ -1064,8 +1677,8 @@ def run(test, params, env):
                                                     "alias", "name")
             if device_bus[0] == "ide":
                 check_cmd = "/usr/libexec/qemu-kvm -device ? 2>&1 |grep -E 'ide-cd|ide-hd'"
-                if process.system(check_cmd, ignore_status=True, shell=True):
-                    test.skip("ide-cd/ide-hd not supported by this qemu-kvm")
+                if process.system(check_cmd, ignore_status=False, shell=True):
+                    test.cancel("ide-cd/ide-hd not supported by this qemu-kvm")
 
                 if devices[0] == "cdrom":
                     device_option = "ide-cd"
@@ -1097,29 +1710,41 @@ def run(test, params, env):
                     cmd += (" | grep usb-storage,bus=%s,port=%s,"
                             "drive=drive-%s,id=%s"
                             % (usb_bus_str, dev_port, dev_id, dev_id))
-                if usb_devices.has_key("input"):
+                if "input" in usb_devices:
                     input_addr = get_device_addr('input', 'tablet')
                     cmd += (" | grep usb-tablet,id=input[0-9],bus=usb.%s,"
                             "port=%s" % (input_addr["bus"],
                                          input_addr["port"]))
-                if usb_devices.has_key("hub"):
+                if "hub" in usb_devices:
                     hub_addr = get_device_addr('hub', 'usb')
                     cmd += (" | grep usb-hub,id=hub0,bus=usb.%s,"
                             "port=%s" % (hub_addr["bus"],
                                          hub_addr["port"]))
-
+            time.sleep(1)
             if process.system(cmd, ignore_status=True, shell=True):
-                test.fail("Cann't see disk option"
+                test.fail("Can not see disk option"
                           " in command line")
 
         if dom_iothreads:
             check_dom_iothread()
 
+        # Check disk cache mode.
+        if check_disk_cache:
+            check_disk_cache_mode(device_targets[0], disk_cache_mode)
+
         # Check in VM after command.
-        if check_patitions:
+        if check_partitions:
             if not check_vm_partitions(devices,
                                        device_targets):
-                test.fail("Cann't see device in VM")
+                test.fail("Can not see device in VM")
+
+        # Check discard in VM after command.
+        if check_discard:
+            check_vm_discard(device_targets[0])
+
+        # Check pci bridge in VM after command.
+        if check_pci_bridge:
+            check_vm_pci_bridge()
 
         # Check disk save and restore.
         if test_disk_save_restore:
@@ -1128,24 +1753,56 @@ def run(test, params, env):
                                     startup_policy)
             if os.path.exists(save_file):
                 os.remove(save_file)
-
+        if restart_libvird:
+            if not utils_libvirtd.libvirtd_restart():
+                test.fail('Libvirtd is expected to be started')
+            vm.wait_for_login()
         # If we testing hotplug, detach the disk at last.
         if device_at_dt_disk:
-            for i in range(len(disks)):
+            for i in list(range(len(disks))):
                 dt_options = ""
                 if devices[i] == "cdrom":
                     dt_options = "--config"
                 ret = virsh.detach_disk(vm_name, device_targets[i],
                                         dt_options, **virsh_dargs)
-                libvirt.check_exit_status(ret)
+                disk_detach_error = False
+                if len(device_attach_error) > i:
+                    disk_detach_error = "yes" == device_attach_error[i]
+                if disk_detach_error:
+                    libvirt.check_exit_status(ret, disk_detach_error)
+                else:
+                    libvirt.check_exit_status(ret)
+                if virtio_disk_hot_unplug_event_watch:
+                    check_info_in_libvird_log_file('"event": "DEVICE_DELETED"')
             # Check disks in VM after hotunplug.
-            if check_patitions_hotunplug:
+            if check_partitions_hotunplug:
                 if not check_vm_partitions(devices,
                                            device_targets, False):
                     test.fail("See device in VM after hotunplug")
 
         elif hotplug:
-            for i in range(len(disks_xml)):
+            # Test attach device multiple iteration
+            if test_attach_device_iteration:
+                attach_option = device_attach_option[0]
+                iteration_times = int(params.get("iteration_times", ""))
+                for counter in range(0, iteration_times):
+                    logging.info("Begin to execute attach or detach %d operations", counter)
+                    ret = virsh.detach_device(vm_name, disks_xml[0].xml,
+                                              flagstr=attach_option, debug=True)
+                    libvirt.check_exit_status(ret)
+                    # Sleep 10 seconds to let VM really cleanup devices.
+                    time.sleep(10)
+                    ret = virsh.attach_device(vm_name, disks_xml[0].xml,
+                                              flagstr=attach_option, debug=True)
+                    libvirt.check_exit_status(ret)
+                    # Check VM partitions on each 20 attempts.
+                    if counter % 20 == 0:
+                        # Sleep 30 seconds to allow disk partitions can really be detected in VM internal.
+                        time.sleep(30)
+                        if not check_vm_partitions(devices, device_targets) and not check_vm_partitions(devices, 'vdc'):
+                            test.fail("Can not see device in VM when attaching disk in %d times" % counter)
+
+            for i in list(range(len(disks_xml))):
                 if len(device_attach_error) > i:
                     if device_attach_error[i] == "yes":
                         continue
@@ -1155,7 +1812,7 @@ def run(test, params, env):
                 libvirt.check_exit_status(ret)
 
             # Check disks in VM after hotunplug.
-            if check_patitions_hotunplug:
+            if check_partitions_hotunplug:
                 if not check_vm_partitions(devices,
                                            device_targets, False):
                     test.fail("See device in VM after hotunplug")
@@ -1163,6 +1820,9 @@ def run(test, params, env):
     finally:
         # Delete snapshots.
         if virsh.domain_exists(vm_name):
+            #To Delet snapshot, destroy vm first.
+            if vm.is_alive():
+                vm.destroy()
             libvirt.clean_up_snapshots(vm_name, domxml=vmxml_backup)
 
         # Recover VM.
@@ -1174,14 +1834,25 @@ def run(test, params, env):
         qemu_config.restore()
         utils_libvirtd.libvirtd_restart()
 
+        # Restore libvirtd config file.
+        if virtio_disk_hot_unplug_event_watch:
+            libvirtd_config.restore()
+
+        # Restore selinux and virt_use_nfs
+        if virt_use_nfs_off:
+            utils_selinux.set_status(selinux_mode)
+            result = process.run("setsebool virt_use_nfs %s" % backup_virt_use_nfs_status,
+                                 shell=True)
+            if result.exit_status:
+                logging.info("Failed to restore virt_use_nfs value")
+
         for img in disks_img:
-            os.remove(img["source"])
             if os.path.exists(img["path"]):
                 process.run("umount %s && rmdir %s"
                             % (img["path"], img["path"]), ignore_status=True, shell=True)
 
         for img in disks:
-            if img.has_key("disk_dev"):
+            if "disk_dev" in img:
                 if img["format"] == "nfs":
                     img["disk_dev"].cleanup()
 
@@ -1191,6 +1862,19 @@ def run(test, params, env):
                     libvirt.delete_scsi_disk()
                 elif img["format"] == "iscsi":
                     libvirt.setup_or_cleanup_iscsi(is_setup=False)
+                    # Clean up secret
+                    if auth_usage and secret_uuid:
+                        virsh.secret_undefine(secret_uuid)
+                    if pool_type:
+                        pvt.cleanup_pool(pool_name, pool_type, pool_target,
+                                         emulated_image, **virsh_dargs)
+                elif img["format"] == "lvm":
+                    clean_up_lvm()
+                elif pool_type and pool_type == "netfs":
+                    pvt.cleanup_pool(pool_name, pool_type, pool_target,
+                                     emulated_image, **virsh_dargs)
                 elif img["format"] not in ["dir"]:
+                    if file_mount_point_type:
+                        process.run("umount %s && rm -rf  %s" % (tmp_demo_img, tmp_demo_img), ignore_status=True, shell=True)
                     if os.path.exists(img["source"]):
                         os.remove(img["source"])

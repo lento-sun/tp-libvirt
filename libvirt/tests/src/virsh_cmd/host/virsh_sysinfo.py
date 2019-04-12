@@ -1,7 +1,6 @@
 import logging
 
-from autotest.client import utils
-from autotest.client.shared import error
+from avocado.utils import process
 
 from virttest import libvirt_xml
 from virttest import virsh
@@ -16,8 +15,8 @@ def get_processor_version():
     """
     processor_version = []
     cmd = "dmidecode -t processor | awk -F: '/Version/ {print $2}'"
-    cmd_result = utils.run(cmd, ignore_status=True)
-    output = cmd_result.stdout.strip()
+    cmd_result = process.run(cmd, ignore_status=True, shell=True)
+    output = cmd_result.stdout_text.strip()
     if output:
         output_list = output.split('\n')
         for i in output_list:
@@ -48,10 +47,10 @@ def run(test, params, env):
     # Check result
     if status_error == "yes":
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
     elif status_error == "no":
         if status != 0:
-            raise error.TestFail("Run failed with right command.")
+            test.fail("Run failed with right command.")
         else:
             dmidecode_version = get_processor_version()
             if dmidecode_version:
@@ -63,7 +62,7 @@ def run(test, params, env):
                 processor_version = []
                 processor_dict = sysinfo_xml.get_all_processors()
                 for i in range(len(processor_dict)):
-                    if processor_dict[i].has_key('version'):
+                    if 'version' in processor_dict[i]:
                         # For some processing libvirt will trim leading
                         # spaces, while for others it trims trailing. This
                         # code compares against dmidecode output that was
@@ -75,5 +74,5 @@ def run(test, params, env):
                               "%s" % processor_version)
 
                 if processor_version != dmidecode_version:
-                    raise error.TestFail("Processor version from sysinfo not"
-                                         " equal to dmidecode output")
+                    test.fail("Processor version from sysinfo not"
+                              " equal to dmidecode output")

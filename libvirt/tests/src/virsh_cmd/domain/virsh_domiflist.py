@@ -1,8 +1,6 @@
 import re
 import logging
 
-from autotest.client.shared import error
-
 from virttest import virsh
 from virttest import utils_net
 from virttest.libvirt_xml import vm_xml
@@ -55,8 +53,8 @@ def run(test, params, env):
 
         try:
             session = vm.wait_for_login(nic_index=login_nic_index)
-        except Exception, detail:
-            raise error.TestFail("Unable to login to VM:%s" % detail)
+        except Exception as detail:
+            test.fail("Unable to login to VM:%s" % detail)
         iface_xml = {}
         error_count = 0
         # Check for the interface values
@@ -103,7 +101,7 @@ def run(test, params, env):
                               "Mac:%s", item['mac'])
             iface_xml = {}
         if error_count > 0:
-            raise error.TestFail("The test failed, consult previous error logs")
+            test.fail("The test failed, consult previous error logs")
 
     def add_iface(vm, at_option=""):
         """
@@ -156,7 +154,7 @@ def run(test, params, env):
 
         result = virsh.domiflist(vm_name, "", ignore_status=True)
         libvirt.check_exit_status(result)
-        old_iflist = parse_interface_details(result.stdout)
+        old_iflist = parse_interface_details(result.stdout.strip())
         logging.debug("Old interface list: %s", old_iflist)
         # Attach interface for testing.
         if attach_iface:
@@ -169,19 +167,19 @@ def run(test, params, env):
 
         vm.verify_alive()
         result = virsh.domiflist(options, additional_options, ignore_status=True)
-        new_iflist = parse_interface_details(result.stdout)
+        new_iflist = parse_interface_details(result.stdout.strip())
         logging.debug("New interface list: %s", new_iflist)
 
         if status_error:
             if result.exit_status == 0:
-                raise error.TestFail("Run passed for incorrect command \nCommand: "
-                                     "virsh domiflist %s\nOutput Status:%s\n"
-                                     % (options, result.exit_status))
+                test.fail("Run passed for incorrect command \nCommand: "
+                          "virsh domiflist %s\nOutput Status:%s\n"
+                          % (options, result.exit_status))
         else:
             if 'print-xml' in attach_option:
                 if len(old_iflist) != len(new_iflist):
-                    raise error.TestFail("Interface attached with"
-                                         " '--print-xml' option")
+                    test.fail("Interface attached with"
+                              " '--print-xml' option")
             else:
                 check_output(new_iflist, vm, login_nic_index)
 

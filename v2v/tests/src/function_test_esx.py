@@ -19,7 +19,7 @@ def run(test, params, env):
     """
     Convert specific esx guest
     """
-    for v in params.itervalues():
+    for v in list(params.values()):
         if "V2V_EXAMPLE" in v:
             test.cancel("Please set real value for %s" % v)
     if utils_v2v.V2V_EXEC is None:
@@ -56,17 +56,32 @@ def run(test, params, env):
             if "device='cdrom'" not in xml:
                 log_fail('CDROM no longer exists')
 
-    def check_vmtools(vmcheck):
+    def check_vmtools(vmcheck, check):
         """
-        Check whether vmware tools packages have been removed
+        Check whether vmware tools packages have been removed,
+        or vmware-tools service has stopped
+
+        :param vmcheck: VMCheck object for vm checking
+        :param check: Checkpoint of different cases
+        :return: None
         """
-        pkgs = vmcheck.session.cmd('rpm -qa').strip()
-        removed_pkgs = params.get('removed_pkgs').strip().split(',')
-        if not removed_pkgs:
-            test.error('Missing param "removed_pkgs"')
-        for pkg in removed_pkgs:
-            if pkg in pkgs:
-                log_fail('Package "%s" not removed' % pkg)
+        if check == 'vmtools':
+            logging.info('Check if packages been removed')
+            pkgs = vmcheck.session.cmd('rpm -qa').strip()
+            removed_pkgs = params.get('removed_pkgs').strip().split(',')
+            if not removed_pkgs:
+                test.error('Missing param "removed_pkgs"')
+            for pkg in removed_pkgs:
+                if pkg in pkgs:
+                    log_fail('Package "%s" not removed' % pkg)
+        elif check == 'vmtools_service':
+            logging.info('Check if service stopped')
+            vmtools_service = params.get('service_name')
+            status = utils_misc.get_guest_service_status(
+                vmcheck.session, vmtools_service)
+            logging.info('Service %s status: %s', vmtools_service, status)
+            if status != 'inactive':
+                log_fail('Service "%s" is not stopped' % vmtools_service)
 
     def check_modprobe(vmcheck):
         """
@@ -78,7 +93,7 @@ def run(test, params, env):
         if not cfg_content:
             test.error('Missing content for search')
         logging.info('Search "%s" in /etc/modprobe.conf', cfg_content)
-        pattern = '\s+'.join(cfg_content.split())
+        pattern = r'\s+'.join(cfg_content.split())
         if not re.search(pattern, content):
             log_fail('Not found "%s"' % cfg_content)
 
@@ -97,14 +112,31 @@ def run(test, params, env):
         else:
             logging.info('device.map has been remaped to "/dev/vd*"')
 
-    def check_snapshot_file(vmcheck):
+    def check_resume_swap(vmcheck):
         """
-        Check if the removed file exists after conversion
+        Check the content of grub files meet expectation.
         """
-        removed_file = params.get('removed_file')
-        logging.debug(vmcheck.session.cmd('test -f %s' % removed_file).stderr)
-        if vmcheck.session.cmd('test -f %s' % removed_file).stderr == 0:
-            log_fail('Removed file "%s" exists after conversion')
+        # Only for grub2
+        chkfiles = ['/etc/default/grub',
+                    '/boot/grub2/grub.cfg',
+                    '/etc/grub2.cfg']
+
+        for file_i in chkfiles:
+            status, content = vmcheck.run_cmd('cat %s' % file_i)
+            if status != 0:
+                log_fail('%s does not exist' % file_i)
+            resume_dev_count = content.count('resume=/dev/')
+            if resume_dev_count == 0 or resume_dev_count != content.count(
+                    'resume=/dev/vd'):
+                reason = 'Maybe the VM\'s swap pariton is lvm'
+                log_fail(
+                    'Content of %s is not correct or %s' %
+                    (file_i, reason))
+
+        content = vmcheck.session.cmd('cat /proc/cmdline')
+        logging.debug('Content of /proc/cmdline:\n%s', content)
+        if 'resume=/dev/vd' not in content:
+            log_fail('Content of /proc/cmdline is not correct')
 
     def check_result(result, status_error):
         """
@@ -121,7 +153,7 @@ def run(test, params, env):
                                                     timeout=v2v_timeout):
                     test.fail('Import VM failed')
             elif output_mode == 'libvirt':
-                virsh.start(vm_name)
+                virsh.start(vm_name, debug=True)
             # Check guest following the checkpoint document after convertion
             logging.info('Checking common checkpoints for v2v')
             vmchecker = VMChecker(test, params, env)
@@ -135,21 +167,22 @@ def run(test, params, env):
                 virsh_session = utils_sasl.VirshSessionSASL(params)
                 virsh_session_id = virsh_session.get_id()
                 check_device_exist('cdrom', virsh_session_id)
-            if checkpoint == 'vmtools':
-                check_vmtools(vmchecker.checker)
+            if checkpoint.startswith('vmtools'):
+                check_vmtools(vmchecker.checker, checkpoint)
             if checkpoint == 'modprobe':
                 check_modprobe(vmchecker.checker)
             if checkpoint == 'device_map':
                 check_device_map(vmchecker.checker)
-            if checkpoint == 'snapshot':
-                check_snapshot_file(vmchecker.checker)
+            if checkpoint == 'resume_swap':
+                check_resume_swap(vmchecker.checker)
             # Merge 2 error lists
             error_list.extend(vmchecker.errors)
         log_check = utils_v2v.check_log(params, output)
         if log_check:
             log_fail(log_check)
         if len(error_list):
-            test.fail('%d checkpoints failed: %s' % (len(error_list), error_list))
+            test.fail('%d checkpoints failed: %s' %
+                      (len(error_list), error_list))
 
     try:
         v2v_params = {
@@ -159,8 +192,8 @@ def run(test, params, env):
             'v2v_opts': '-v -x', 'input_mode': 'libvirt',
             'storage': params.get('output_storage', 'default'),
             'network': params.get('network'),
-            'bridge':  params.get('bridge'),
-            'target':  params.get('target')
+            'bridge': params.get('bridge'),
+            'target': params.get('target')
         }
 
         os.environ['LIBGUESTFS_BACKEND'] = 'direct'
@@ -169,8 +202,8 @@ def run(test, params, env):
 
         # Create password file for access to ESX hypervisor
         vpx_passwd = params.get("vpx_password")
-        logging.debug(vpx_passwd)
-        vpx_passwd_file = os.path.join(data_dir.get_tmp_dir(), "vpx_passwd")
+        logging.debug("vpx password is %s" % vpx_passwd)
+        vpx_passwd_file = params.get("vpx_passwd_file")
         with open(vpx_passwd_file, 'w') as pwd_f:
             pwd_f.write(vpx_passwd)
         v2v_params['v2v_opts'] += " --password-file %s" % vpx_passwd_file
@@ -199,13 +232,14 @@ def run(test, params, env):
             utils_package.package_install('OVMF')
         if checkpoint == 'root_ask':
             v2v_params['v2v_opts'] += ' --root ask'
-            v2v_params['custom_inputs'] = params.get('choice', '1')
+            v2v_params['custom_inputs'] = params.get('choice', '2')
         if checkpoint.startswith('root_') and checkpoint != 'root_ask':
             root_option = params.get('root_option')
             v2v_params['v2v_opts'] += ' --root %s' % root_option
         if checkpoint == 'copy_to_local':
             esx_password = params.get('esx_password')
-            esx_passwd_file = os.path.join(data_dir.get_tmp_dir(), "esx_passwd")
+            esx_passwd_file = os.path.join(
+                data_dir.get_tmp_dir(), "esx_passwd")
             logging.info('Prepare esx password file')
             with open(esx_passwd_file, 'w') as pwd_f:
                 pwd_f.write(esx_password)
@@ -231,8 +265,8 @@ def run(test, params, env):
             v2v_result = remote_virsh.dumpxml(vm_name)
         else:
             v2v_result = utils_v2v.v2v_cmd(v2v_params)
-        if v2v_params.has_key('new_name'):
-            params['main_vm'] = v2v_params['new_name']
+        if 'new_name' in v2v_params:
+            vm_name = params['main_vm'] = v2v_params['new_name']
         check_result(v2v_result, status_error)
 
     finally:
@@ -244,3 +278,5 @@ def run(test, params, env):
             logging.info('Unset http_proxy&https_proxy')
             os.environ.pop('http_proxy')
             os.environ.pop('https_proxy')
+        # Cleanup constant files
+        utils_v2v.cleanup_constant_files(params)

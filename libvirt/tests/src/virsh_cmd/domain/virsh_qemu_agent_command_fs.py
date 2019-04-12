@@ -3,6 +3,7 @@ import time
 import logging
 
 from virttest import virsh
+from virttest import data_dir
 from virttest import utils_misc
 from virttest.utils_test import libvirt
 from virttest.libvirt_xml import vm_xml
@@ -49,10 +50,10 @@ def run(test, params, env):
                     else:
                         return int(session.cmd_output(data_cmd).strip().
                                    split()[1])
-            except (IndexError, ValueError), details:
+            except (IndexError, ValueError) as details:
                 test.fail("Get dirty info failed: %s" % details)
 
-        device_source_path = os.path.join(test.tmpdir, "disk.img")
+        device_source_path = os.path.join(data_dir.get_tmp_dir(), "disk.img")
         device_source = libvirt.create_local_disk("file", path=device_source_path,
                                                   disk_format="qcow2")
         vm.prepare_guest_agent()
@@ -65,7 +66,7 @@ def run(test, params, env):
             old_parts = libvirt.get_parts_list(session)
             ret = virsh.attach_disk(vm_name, device_source, "vdd")
             if ret.exit_status:
-                test.fail("Attaching device failed before testing agent:%s" % ret.stdout)
+                test.fail("Attaching device failed before testing agent:%s" % ret.stdout.strip())
             time.sleep(1)
             new_parts = libvirt.get_parts_list(session)
             added_part = list(set(new_parts).difference(set(old_parts)))
@@ -87,7 +88,7 @@ def run(test, params, env):
                                                      ignore_status=True,
                                                      debug=True)
             libvirt.check_exit_status(st_cmd_result)
-            if not st_cmd_result.stdout.count("frozen"):
+            if not st_cmd_result.stdout.strip().count("frozen"):
                 test.fail("Guest filesystem status is not frozen: %s"
                           % st_cmd_result.stdout.strip())
 
@@ -102,7 +103,7 @@ def run(test, params, env):
                                                      ignore_status=True,
                                                      debug=True)
             libvirt.check_exit_status(st_cmd_result)
-            if not st_cmd_result.stdout.count("thawed"):
+            if not st_cmd_result.stdout.strip().count("thawed"):
                 test.fail("Guest filesystem status is not thawed: %s"
                           % st_cmd_result.stdout.strip())
             logging.info("Original dirty data: %s" % org_dirty_info)

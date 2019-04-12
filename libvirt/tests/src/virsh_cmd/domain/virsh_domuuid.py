@@ -1,10 +1,9 @@
 import logging
 
-from autotest.client.shared import error
-
 from virttest import virsh
 from virttest import libvirt_xml
 from virttest import utils_libvirtd
+from virttest.utils_test.libvirt import check_domuuid_compliant_with_rfc4122
 
 
 def run(test, params, env):
@@ -58,9 +57,11 @@ def run(test, params, env):
     # Check status_error
     if status_error == "yes":
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
     elif status_error == "no":
+        if not check_domuuid_compliant_with_rfc4122(output):
+            test.fail("UUID is not compliant with RFC4122 format")
         if status != 0:
-            raise error.TestFail("Run failed with right command.")
+            test.fail("Run failed with right command.")
         elif xml_domuuid != output:
-            raise error.TestFail("UUID from virsh command is not expected.")
+            test.fail("UUID from virsh command is not expected.")

@@ -3,9 +3,10 @@ import re
 import copy
 import ast
 import logging
-import time
+import platform
 
 from avocado.utils import process
+from avocado.utils.software_manager import SoftwareManager
 
 from virttest import virsh
 from virttest import utils_config, utils_libvirtd, utils_misc
@@ -31,7 +32,7 @@ def run(test, params, env):
     vm = env.get_vm(vm_name)
 
     vcpus_placement = params.get("vcpus_placement", "static")
-    vcpus_current = int(params.get("vcpus_current", "4"))
+    vcpus_crt = int(params.get("vcpus_current", "4"))
     vcpus_max = int(params.get("vcpus_max", "8"))
     vcpus_enabled = params.get("vcpus_enabled", "")
     vcpus_hotplug = params.get("vcpus_hotpluggable", "")
@@ -39,9 +40,17 @@ def run(test, params, env):
     err_msg = params.get("err_msg", "")
     config_libvirtd = params.get("config_libvirtd", "yes") == "yes"
     log_file = params.get("log_file", "libvirtd.log")
-    set_live_vcpus = params.get("set_live_vcpus", "")
-    set_config_vcpus = params.get("set_config_vcpus", "")
-
+    live_vcpus = params.get("set_live_vcpus", "")
+    config_vcpus = params.get("set_config_vcpus", "")
+    enable_vcpu = params.get("set_enable_vcpu", "")
+    disable_vcpu = params.get("set_disable_vcpu", "")
+    # Install cgroup utils
+    cgutils = "libcgroup-tools"
+    if "ubuntu" in platform.dist()[0].lower():
+        cgutils = "cgroup-tools"
+    sm = SoftwareManager()
+    if not sm.check_installed(cgutils) and not sm.install(cgutils):
+        test.cancel("cgroup utils package install failed")
     # Backup domain XML
     vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
     vmxml_backup = vmxml.copy()
@@ -51,7 +60,8 @@ def run(test, params, env):
         # Configure libvirtd log
         if config_libvirtd:
             config_path = os.path.join(data_dir.get_tmp_dir(), log_file)
-            open(config_path, 'a').close()
+            with open(config_path, 'a') as f:
+                pass
             config = utils_config.LibvirtdConfig()
             log_outputs = "1:file:%s" % config_path
             config.log_outputs = log_outputs
@@ -64,7 +74,7 @@ def run(test, params, env):
         # Set vcpu: placement,current,max vcpu
         vmxml.placement = vcpus_placement
         vmxml.vcpu = vcpus_max
-        vmxml.current_vcpu = vcpus_current
+        vmxml.current_vcpu = vcpus_crt
         del vmxml.cpuset
 
         # Create vcpu xml with vcpu hotpluggable and order
@@ -78,7 +88,7 @@ def run(test, params, env):
             vcpu['id'] = str(vcpu_id)
             if str(vcpu_id) in en_list:
                 vcpu['enabled'] = 'yes'
-                if order_dict.has_key(str(vcpu_id)):
+                if str(vcpu_id) in order_dict:
                     vcpu['order'] = order_dict[str(vcpu_id)]
             else:
                 vcpu['enabled'] = 'no'
@@ -93,6 +103,16 @@ def run(test, params, env):
         vcpus_xml.vcpu = vcpu_list
 
         vmxml.vcpus = vcpus_xml
+
+        # Remove influence from topology setting
+        try:
+            logging.info('Remove influence from topology setting')
+            cpuxml = vmxml.cpu
+            del cpuxml.topology
+            vmxml.cpu = cpuxml
+        except Exception as e:
+            pass
+
         vmxml.sync()
 
         # Start VM
@@ -102,16 +122,24 @@ def run(test, params, env):
         if err_msg:
             libvirt.check_result(ret, err_msg)
         else:
-            # Wait for domain is stable
-            time.sleep(20)
+            # Wait for domain
+            vm.wait_for_login()
 
-            if set_live_vcpus:
-                ret = virsh.setvcpus(vm_name, set_live_vcpus, ignore_status=True,
+            if enable_vcpu:
+                ret = virsh.setvcpu(vm_name, enable_vcpu, "--enable",
+                                    ignore_status=False, debug=True)
+                vcpus_crt += 1
+            if disable_vcpu:
+                ret = virsh.setvcpu(vm_name, disable_vcpu, "--disable",
+                                    ingnore_status=False, debug=True)
+                vcpus_crt -= 1
+            if live_vcpus:
+                ret = virsh.setvcpus(vm_name, live_vcpus, ignore_status=False,
                                      debug=True)
-                vcpus_current = int(set_live_vcpus)
-            if set_config_vcpus:
-                ret = virsh.setvcpus(vm_name, set_config_vcpus, "--config",
-                                     ignore_status=True, debug=True)
+                vcpus_crt = int(live_vcpus)
+            if config_vcpus:
+                ret = virsh.setvcpus(vm_name, config_vcpus, "--config",
+                                     ignore_status=False, debug=True)
 
             # Check QEMU command line
             cmd = ("ps -ef| grep %s| grep 'maxcpus=%s'" % (vm_name, vcpus_max))
@@ -141,20 +169,20 @@ def run(test, params, env):
             if len(max_list) != 2:
                 test.fail("vcpucount maximum info is not correct.")
 
-            if set_live_vcpus:
-                crt_live_list = re.findall(r"current.*live.*%s" % set_live_vcpus, output)
+            if live_vcpus:
+                crt_live_list = re.findall(r"current.*live.*%s" % live_vcpus, output)
                 logging.info("vcpucount crt_live_list: \n %s", crt_live_list)
                 if len(crt_live_list) != 1:
                     test.fail("vcpucount: current live info is not correct.")
-            elif set_config_vcpus:
-                crt_cfg_list = re.findall(r"current.*config.*%s" % set_config_vcpus, output)
+            elif config_vcpus:
+                crt_cfg_list = re.findall(r"current.*config.*%s" % config_vcpus, output)
                 logging.info("vcpucount crt_cfg_list: \n %s", crt_cfg_list)
                 if len(crt_cfg_list) != 1:
                     test.fail("vcpucount: current config info is not correct.")
             else:
-                crt_list = re.findall(r"current.*[config|live].*%s" % vcpus_current, output)
-                logging.info("vcpucount crt_list: \n %s", crt_list)
-                if len(crt_list) != 2:
+                crt_live_list = re.findall(r"current.*live.*%s" % vcpus_crt, output)
+                logging.info("vcpucount crt_live_list: \n %s", crt_live_list)
+                if len(crt_live_list) != 1:
                     test.fail("vcpucount: current info is not correct.")
 
             # Check guest vcpu info
@@ -162,18 +190,18 @@ def run(test, params, env):
             output = ret.stdout.strip()
             vcpu_lines = re.findall(r"VCPU:.*\n", output)
             logging.info("vcpuinfo vcpu_lines: \n %s", vcpu_lines)
-            if len(vcpu_lines) != vcpus_current:
+            if len(vcpu_lines) != vcpus_crt:
                 test.fail("vcpuinfo is not correct.")
 
             # Check cpu in guest
-            if not utils_misc.check_if_vm_vcpu_match(vcpus_current, vm):
-                test.fail("cpu number in VM is not correct, it should be %s cpus" % vcpus_current)
+            if not utils_misc.check_if_vm_vcpu_match(vcpus_crt, vm):
+                test.fail("cpu number in VM is not correct, it should be %s cpus" % vcpus_crt)
 
             # Check VM xml change for cold-plug/cold-unplug
-            if set_config_vcpus:
+            if config_vcpus:
                 inactive_xml = virsh.dumpxml(vm_name, "--inactive").stdout.strip()
                 crt_vcpus_xml = re.findall(r"vcpu.*current=.%s.*" %
-                                           set_config_vcpus, inactive_xml)
+                                           config_vcpus, inactive_xml)
                 logging.info("dumpxml --inactive xml: \n %s", crt_vcpus_xml)
                 if len(crt_vcpus_xml) != 1:
                     test.fail("Dumpxml with --inactive,"
@@ -185,7 +213,7 @@ def run(test, params, env):
             # Recheck VM xml
             re_dump_xml = virsh.dumpxml(vm_name).stdout.strip()
             re_vcpu_items = re.findall(r"vcpu.*", re_dump_xml)
-            if cmp(vcpu_items, re_vcpu_items) != 0:
+            if vcpu_items != re_vcpu_items:
                 test.fail("After restarting libvirtd,"
                           "VM xml changed unexpectedly.")
 

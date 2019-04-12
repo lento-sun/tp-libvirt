@@ -1,9 +1,8 @@
 import os
 import re
-import commands
 import tempfile
 
-from autotest.client.shared import error
+from avocado.utils import process
 
 from virttest import virsh
 from virttest import data_dir
@@ -32,8 +31,8 @@ def run(test, params, env):
 
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     virsh_dargs = {'debug': True}
     if params.get('setup_libvirt_polkit') == 'yes':
@@ -43,9 +42,9 @@ def run(test, params, env):
     if secret_ref == "secret_valid_uuid":
         # Generate valid uuid
         cmd = "uuidgen"
-        status, uuid = commands.getstatusoutput(cmd)
+        status, uuid = process.getstatusoutput(cmd)
         if status:
-            raise error.TestNAError("Failed to generate valid uuid")
+            test.cancel("Failed to generate valid uuid")
 
     # Get a full path of tmpfile, the tmpfile need not exist
     tmp_dir = data_dir.get_tmp_dir()
@@ -66,9 +65,8 @@ def run(test, params, env):
     xmlfile = tmp_file.name
     tmp_file.close()
 
-    fd = open(xmlfile, 'w')
-    fd.write(secret_xml)
-    fd.close()
+    with open(xmlfile, 'w') as fd:
+        fd.write(secret_xml)
 
     try:
         virsh.secret_define(xmlfile, debug=True)
@@ -76,11 +74,11 @@ def run(test, params, env):
         cmd_result = virsh.secret_dumpxml(uuid, **virsh_dargs)
         output = cmd_result.stdout.strip()
         if not status_error and cmd_result.exit_status:
-            raise error.TestFail("Dumping the xml of secret object failed")
+            test.fail("Dumping the xml of secret object failed")
 
         match_string = "<uuid>%s</uuid>" % uuid
         if not re.search(match_string, output):
-            raise error.TestFail("The secret xml is not valid")
+            test.fail("The secret xml is not valid")
     finally:
         #Cleanup
         virsh.secret_undefine(uuid, debug=True)

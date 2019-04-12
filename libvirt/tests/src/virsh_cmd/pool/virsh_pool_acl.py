@@ -4,12 +4,12 @@ import logging
 
 from avocado.utils import process
 
-from autotest.client import lv_utils
-from autotest.client.shared import error
-
 from virttest import libvirt_storage
+from virttest import data_dir
 from virttest import virsh
+from virttest.staging import lv_utils
 from virttest.utils_test import libvirt as utlv
+from virttest.compat_52lts import decode_to_text as to_text
 
 from provider import libvirt_version
 
@@ -37,9 +37,9 @@ def run(test, params, env):
     pool_type = params.get("pool_type", "dir")
     pool_target = params.get("pool_target", "")
     # The file for dumped pool xml
-    pool_xml = os.path.join(test.tmpdir, "pool.xml.tmp")
+    pool_xml = os.path.join(data_dir.get_tmp_dir(), "pool.xml.tmp")
     if os.path.dirname(pool_target) is "":
-        pool_target = os.path.join(test.tmpdir, pool_target)
+        pool_target = os.path.join(data_dir.get_tmp_dir(), pool_target)
     vol_name = params.get("vol_name", "temp_vol_1")
     # Use pool name as VG name
     vg_name = pool_name
@@ -75,8 +75,8 @@ def run(test, params, env):
 
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     acl_dargs = {'uri': uri, 'unprivileged_user': unprivileged_user,
                  'debug': True}
@@ -96,8 +96,8 @@ def run(test, params, env):
         else:
             result = virsh.pool_list(option, ignore_status=True)
         utlv.check_exit_status(result, False)
-        output = re.findall(r"(\S+)\ +(\S+)\ +(\S+)[\ +\n]",
-                            str(result.stdout))
+        output = re.findall(r"(\S+)\ +(\S+)\ +(\S+)",
+                            str(result.stdout.strip()))
         for item in output:
             if pool_name in item[0]:
                 found = True
@@ -107,9 +107,9 @@ def run(test, params, env):
         else:
             logging.debug("Not find pool %s in pool list.", pool_name)
         if expect_error and found:
-            raise error.TestFail("Unexpect pool '%s' exist." % pool_name)
+            test.fail("Unexpect pool '%s' exist." % pool_name)
         if not expect_error and not found:
-            raise error.TestFail("Expect pool '%s' doesn't exist." % pool_name)
+            test.fail("Expect pool '%s' doesn't exist." % pool_name)
 
     # Run Testcase
     kwargs = {'source_format': params.get('pool_source_format', 'ext4')}
@@ -207,17 +207,17 @@ def run(test, params, env):
             result = virsh.pool_destroy(pool_name)
         if result:
             if destroy_error:
-                raise error.TestFail("Expect fail, but run successfully.")
+                test.fail("Expect fail, but run successfully.")
         else:
             if not destroy_error:
-                raise error.TestFail("Pool %s destroy failed, not expected."
-                                     % pool_name)
+                test.fail("Pool %s destroy failed, not expected."
+                          % pool_name)
             else:
                 # Redo under negative case to keep case continue
                 if virsh.pool_destroy(pool_name):
                     logging.debug("Pool %s destroyed.", pool_name)
                 else:
-                    raise error.TestFail("Destroy pool % failed." % pool_name)
+                    test.fail("Destroy pool % failed." % pool_name)
 
         # Step (6)
         # Pool refresh for 'dir' type pool
@@ -245,7 +245,7 @@ def run(test, params, env):
         if virsh.pool_destroy(pool_name):
             logging.debug("Pool %s destroyed.", pool_name)
         else:
-            raise error.TestFail("Destroy pool % failed." % pool_name)
+            test.fail("Destroy pool % failed." % pool_name)
         if pool_type == "dir":
             if os.path.exists(vol_path):
                 os.remove(vol_path)
@@ -258,8 +258,8 @@ def run(test, params, env):
             check_pool_list(pool_name, option)
             if not delete_error:
                 if os.path.exists(pool_target):
-                    raise error.TestFail("The target path '%s' still exist." %
-                                         pool_target)
+                    test.fail("The target path '%s' still exist." %
+                              pool_target)
 
         result = virsh.pool_undefine(pool_name, ignore_status=True)
         utlv.check_exit_status(result)
@@ -272,7 +272,7 @@ def run(test, params, env):
             logging.error("Can't delete pool: %s", pool_name)
         if cleanup_env[2]:
             cmd = "pvs |grep %s |awk '{print $1}'" % vg_name
-            pv_name = process.system_output(cmd, shell=True)
+            pv_name = to_text(process.system_output(cmd, shell=True))
             lv_utils.vg_remove(vg_name)
             process.run("pvremove %s" % pv_name, shell=True)
         if cleanup_env[1]:

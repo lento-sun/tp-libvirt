@@ -1,5 +1,6 @@
 import os
 import logging
+import platform
 
 from avocado.utils import process
 from avocado.core import exceptions
@@ -42,7 +43,7 @@ def run(test, params, env):
         for i in left_node:
             left_node_mem_total += int(memory_status[i])
         if left_node_mem_total > used_mem_total:
-            raise exceptions.TestFail("nodes memory usage not expected.")
+            test.fail("nodes memory usage not expected.")
 
     def format_affinity_str(cpu_list):
         """
@@ -53,7 +54,7 @@ def run(test, params, env):
         """
         cmd = "lscpu | grep '^CPU(s):'"
         ret = process.run(cmd, shell=True)
-        cpu_num = int(ret.stdout.split(':')[1].strip())
+        cpu_num = int(ret.stdout_text.split(':')[1].strip())
         cpu_affinity_str = ""
         for i in range(cpu_num):
             if i in cpu_list:
@@ -75,7 +76,7 @@ def run(test, params, env):
         if node:
             tmp_list = []
             for node_num in node:
-                host_node = utils_misc.NumaNode(i=node_num+1)
+                host_node = utils_misc.NumaNode(i=node_num + 1)
                 logging.debug("node %s cpu list is %s" %
                               (node_num, host_node.cpus))
                 tmp_list += host_node.cpus
@@ -85,7 +86,21 @@ def run(test, params, env):
         ret = format_affinity_str(cpu_list)
         logging.debug("expect cpu affinity is %s", ret)
         if cpu_affinity != ret:
-            raise exceptions.TestFail("vcpuinfo cpu affinity not expected")
+            test.fail("vcpuinfo cpu affinity not expected")
+
+    def numa_mode_check(mode_nodeset):
+        """
+        when the mode = 'preferred' or 'interleave', it is better to check
+        numa_maps.
+        """
+        vm_pid = vm.get_pid()
+        numa_map = '/proc/%s/numa_maps' % vm_pid
+        # Open a file
+        with open(numa_map) as file:
+            for line in file.readlines():
+                if line.split()[1] != mode_nodeset:
+                    test.fail("numa node and nodeset %s is "
+                              "not expected" % mode_nodeset)
 
     vcpu_placement = params.get("vcpu_placement")
     vcpu_cpuset = params.get("vcpu_cpuset")
@@ -95,6 +110,11 @@ def run(test, params, env):
     vm = env.get_vm(vm_name)
     backup_xml = libvirt_xml.VMXML.new_from_dumpxml(vm_name)
 
+    # Get host numa node list
+    host_numa_node = utils_misc.NumaInfo()
+    node_list = host_numa_node.online_nodes_withmem
+    logging.debug("host node list is %s", " ".join(map(str, node_list)))
+
     # Prepare numatune memory parameter dict
     mem_tuple = ('memory_mode', 'memory_placement', 'memory_nodeset')
     numa_memory = {}
@@ -102,6 +122,21 @@ def run(test, params, env):
         value = params.get(mem_param)
         if value:
             numa_memory[mem_param.split('_')[1]] = value
+    arch = platform.machine()
+    if 'ppc64' in arch:
+        try:
+            ppc_memory_nodeset = ""
+            nodes = numa_memory["nodeset"]
+            if '-' in nodes:
+                for nnode in range(int(nodes.split('-')[0]), int(nodes.split('-')[1]) + 1):
+                    ppc_memory_nodeset += str(node_list[nnode]) + ','
+            else:
+                node_lst = nodes.split(',')
+                for nnode in range(len(node_lst)):
+                    ppc_memory_nodeset += str(node_list[int(node_lst[nnode])]) + ','
+            numa_memory["nodeset"] = ppc_memory_nodeset[:-1]
+        except (KeyError, IndexError):
+            pass
 
     # Prepare libvirtd session with log level as 1
     config_path = os.path.join(data_dir.get_tmp_dir(), "virt-test.conf")
@@ -124,15 +159,17 @@ def run(test, params, env):
         except path.CmdNotFoundError:
             pass
 
-        # Get host numa node list
-        host_numa_node = utils_misc.NumaInfo()
-        node_list = host_numa_node.online_nodes
-        logging.debug("host node list is %s", node_list)
+        # Allow for more times to libvirtd restarted sucessfully.
+        ret = utils_misc.wait_for(lambda: libvirtd.is_working(),
+                                  timeout=240,
+                                  step=1)
+        if not ret:
+            test.fail("Libvirtd hang after restarted")
 
         # Get host cpu list
         tmp_list = []
         for node_num in node_list:
-            host_node = utils_misc.NumaNode(i=node_num+1)
+            host_node = utils_misc.NumaNode(i=node_num + 1)
             logging.debug("node %s cpu list is %s" %
                           (node_num, host_node.cpus))
             tmp_list += host_node.cpus
@@ -152,18 +189,21 @@ def run(test, params, env):
             if not set(pre_cpuset).issubset(cpu_list):
                 raise exceptions.TestSkipError("cpuset %s out of range" %
                                                vcpu_cpuset)
-
         vmxml = libvirt_xml.VMXML.new_from_dumpxml(vm_name)
         vmxml.numa_memory = numa_memory
         vcpu_num = vmxml.vcpu
         max_mem = vmxml.max_mem
+        if vmxml.xmltreefile.find('cputune'):
+            vmxml.xmltreefile.remove_by_xpath('/cputune')
+        else:
+            logging.debug('No vcpupin found')
         if vcpu_placement:
             vmxml.placement = vcpu_placement
         if vcpu_cpuset:
             vmxml.cpuset = vcpu_cpuset
         logging.debug("vm xml is %s", vmxml)
         vmxml.sync()
-        numad_cmd_opt = "-w %s:%s" % (vcpu_num, max_mem/1024)
+        numad_cmd_opt = "-w %s:%s" % (vcpu_num, max_mem // 1024)
 
         try:
             vm.start()
@@ -180,9 +220,9 @@ def run(test, params, env):
                 pre_numa_memory = numa_memory
 
             if pre_numa_memory != numa_memory_new:
-                raise exceptions.TestFail("memory config %s not expected "
-                                          "after domain start" %
-                                          numa_memory_new)
+                test.fail("memory config %s not expected "
+                          "after domain start" %
+                          numa_memory_new)
 
             pos_vcpu_placement = vmxml_new.placement
             logging.debug("vcpu placement after domain start is %s",
@@ -192,16 +232,15 @@ def run(test, params, env):
                 logging.debug("vcpu cpuset after vm start is %s", pos_cpuset)
             except libvirt_xml.xcepts.LibvirtXMLNotFoundError:
                 if vcpu_cpuset and vcpu_placement != 'auto':
-                    raise exceptions.TestFail("cpuset not found in domain "
-                                              "xml.")
+                    test.fail("cpuset not found in domain xml.")
 
-        except virt_vm.VMStartError, e:
+        except virt_vm.VMStartError as e:
             # Starting VM failed.
             if status_error:
                 return
             else:
-                raise exceptions.TestFail("Test failed in positive case.\n "
-                                          "error: %s\n%s" % (e, bug_url))
+                test.fail("Test failed in positive case.\n "
+                          "error: %s\n%s" % (e, bug_url))
 
         # Check qemu process numa memory usage
         memory_status, qemu_cpu = utils_test.qemu.get_numa_status(
@@ -216,35 +255,48 @@ def run(test, params, env):
                 total_cpu += node_cpu
             for i in total_cpu:
                 if int(i) not in pre_cpuset:
-                    raise exceptions.TestFail("cpu %s is not expected" % i)
+                    test.fail("cpu %s is not expected" % i)
             cpu_affinity_check(cpuset=pre_cpuset)
         if numa_memory.get('nodeset'):
             # If there are inconsistent node numbers on host,
             # convert it into sequence number so that it can be used
             # in mem_compare
-            left_node = [node_list.index(i) for i in node_list if i not in used_node]
-            used_node = [node_list.index(i) for i in used_node]
-            mem_compare(used_node, left_node)
-
+            if numa_memory.get('mode') == 'strict':
+                left_node = [node_list.index(i) for i in node_list if i not in used_node]
+                used_node = [node_list.index(i) for i in used_node]
+                mem_compare(used_node, left_node)
+            elif numa_memory.get('mode') == 'preferred':
+                mode_nodeset = 'prefer:' + numa_memory.get('nodeset')
+                numa_mode_check(mode_nodeset)
+            else:
+                mode_nodeset = numa_memory.get('mode') + ':' + numa_memory.get('nodeset')
+                numa_mode_check(mode_nodeset)
         logging.debug("numad log list is %s", numad_log)
         if vcpu_placement == 'auto' or numa_memory.get('placement') == 'auto':
             if not numad_log:
-                raise exceptions.TestFail("numad usage not found in libvirtd "
-                                          "log")
+                test.fail("numad usage not found in libvirtd log")
             if numad_log[0].split("numad ")[-1] != numad_cmd_opt:
-                raise exceptions.TestFail("numad command not expected in log")
+                logging.warning('numa log:\n%s\n' % numad_log[0].split("numad ")[-1])
+                logging.warning('numa cmd opt:\n%s\n' % numad_cmd_opt)
+                test.fail("numad command not expected in log")
             numad_ret = numad_log[1].split("numad: ")[-1]
             numad_node = utils_test.libvirt.cpus_parser(numad_ret)
             left_node = [node_list.index(i) for i in node_list if i not in numad_node]
             numad_node_seq = [node_list.index(i) for i in numad_node]
             logging.debug("numad nodes are %s", numad_node)
             if numa_memory.get('placement') == 'auto':
-                mem_compare(numad_node_seq, left_node)
+                if numa_memory.get('mode') == 'strict':
+                    mem_compare(numad_node_seq, left_node)
+                elif numa_memory.get('mode') == 'preferred':
+                    mode_nodeset = 'prefer:' + numad_ret
+                    numa_mode_check(mode_nodeset)
+                else:
+                    mode_nodeset = numa_memory.get('mode') + ':' + numad_ret
+                    numa_mode_check(mode_nodeset)
             if vcpu_placement == 'auto':
                 for i in left_node:
                     if qemu_cpu[i]:
-                        raise exceptions.TestFail("cpu usage in node %s is "
-                                                  "not expected" % i)
+                        test.fail("cpu usage in node %s is not expected" % i)
                 cpu_affinity_check(node=numad_node)
 
     finally:

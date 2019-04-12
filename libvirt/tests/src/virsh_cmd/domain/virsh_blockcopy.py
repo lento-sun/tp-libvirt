@@ -138,7 +138,7 @@ def check_xml(vm_name, target, dest_path, blk_options):
                 if disk_mirror_src == dest_path:
                     logging.debug("Find %s in <mirror> element", dest_path)
                     re2 = 2
-        except Exception, detail:
+        except Exception as detail:
             logging.error(detail)
             return False
     finally:
@@ -312,7 +312,7 @@ def run(test, params, env):
     libvirtd_utl = utils_libvirtd.Libvirtd()
     libvirtd_conf = utils_config.LibvirtdConfig()
     libvirtd_conf["log_filters"] = '"3:json 1:libvirt 1:qemu"'
-    libvirtd_log_path = os.path.join(test.tmpdir, "libvirtd.log")
+    libvirtd_log_path = os.path.join(data_dir.get_tmp_dir(), "libvirtd.log")
     libvirtd_conf["log_outputs"] = '"1:file:%s"' % libvirtd_log_path
     logging.debug("the libvirtd config file content is:\n %s" %
                   libvirtd_conf)
@@ -367,6 +367,10 @@ def run(test, params, env):
         # Add all disks into xml file.
         vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
         disks = vmxml.devices.by_device_tag('disk')
+        # Remove non-storage disk such as 'cdrom'
+        for disk in disks:
+            if disk.device != 'disk':
+                disks.remove(disk)
         new_disks = []
         src_disk_xml = disks[0]
         disk_xml = snap_xml.SnapDiskXML()
@@ -383,21 +387,21 @@ def run(test, params, env):
         disk_xml.driver = driver_attr
 
         new_attrs = disk_xml.source.attrs
-        if disk_xml.source.attrs.has_key('file'):
+        if 'file' in disk_xml.source.attrs:
             new_file = os.path.join(tmp_dir, "blockcopy_shallow.snap")
             snapshot_external_disks.append(new_file)
             new_attrs.update({'file': new_file})
             hosts = None
-        elif (disk_xml.source.attrs.has_key('dev') or
-              disk_xml.source.attrs.has_key('name') or
-              disk_xml.source.attrs.has_key('pool')):
+        elif ('dev' in disk_xml.source.attrs or
+              'name' in disk_xml.source.attrs or
+              'pool' in disk_xml.source.attrs):
             if (disk_xml.type_name == 'block' or
                     disk_source_protocol == 'iscsi'):
                 disk_xml.type_name = 'block'
-                if new_attrs.has_key('name'):
+                if 'name' in new_attrs:
                     del new_attrs['name']
                     del new_attrs['protocol']
-                elif new_attrs.has_key('pool'):
+                elif 'pool' in new_attrs:
                     del new_attrs['pool']
                     del new_attrs['volume']
                     del new_attrs['mode']
@@ -470,7 +474,7 @@ def run(test, params, env):
 
         # Prepare transient/persistent vm
         if persistent_vm == "no" and vm.is_persistent():
-            vm.undefine()
+            vm.undefine("--nvram")
         elif persistent_vm == "yes" and not vm.is_persistent():
             new_xml.define()
 
@@ -487,7 +491,7 @@ def run(test, params, env):
             status = cmd_result.exit_status
             if status != 0:
                 raise exceptions.TestFail("Run blockcopy command fail: %s" %
-                                          cmd_result.stdout + cmd_result.stderr)
+                                          cmd_result.stdout.strip() + cmd_result.stderr)
             elif not os.path.exists(dest_path):
                 raise exceptions.TestFail("Cannot find the created copy")
 
@@ -523,7 +527,7 @@ def run(test, params, env):
                 if val == 0:
                     try:
                         finish_job(vm_name, target, timeout)
-                    except JobTimeout, excpt:
+                    except JobTimeout as excpt:
                         raise exceptions.TestFail("Run command failed: %s" %
                                                   excpt)
                 if options.count("--raw") and not with_blockdev:
@@ -556,7 +560,7 @@ def run(test, params, env):
                     utl.check_exit_status(ret, status_error)
                     session.close()
             else:
-                raise exceptions.TestFail(cmd_result.stdout + cmd_result.stderr)
+                raise exceptions.TestFail(cmd_result.stdout.strip() + cmd_result.stderr)
         else:
             if status:
                 logging.debug("Expect error: %s", cmd_result.stderr)
@@ -569,7 +573,7 @@ def run(test, params, env):
                 # check, so also do check in libvirtd log to confirm.
                 if options.count("--timeout") and options.count("--wait"):
                     log_pattern = "Copy aborted"
-                    if (re.search(log_pattern, cmd_result.stdout) or
+                    if (re.search(log_pattern, cmd_result.stdout.strip()) or
                             chk_libvirtd_log(libvirtd_log_path,
                                              log_pattern, "debug")):
                         logging.debug("Found success a timed out block copy")
@@ -596,7 +600,7 @@ def run(test, params, env):
                 original_xml.sync(option)
             else:
                 original_xml.define()
-        except Exception, e:
+        except Exception as e:
             logging.error(e)
         for disk in snapshot_external_disks:
             if os.path.exists(disk):
@@ -613,7 +617,7 @@ def run(test, params, env):
         try:
             if nfs_cleanup:
                 utl.setup_or_cleanup_nfs(is_setup=False)
-        except Exception, e:
+        except Exception as e:
             logging.error(e)
         # Clean up iSCSI
         try:
@@ -621,7 +625,7 @@ def run(test, params, env):
                 utl.setup_or_cleanup_iscsi(is_setup=False, emulated_image=iscsi_n)
                 # iscsid will be restarted, so give it a break before next loop
                 time.sleep(5)
-        except Exception, e:
+        except Exception as e:
             logging.error(e)
         if os.path.exists(dest_path):
             os.remove(dest_path)

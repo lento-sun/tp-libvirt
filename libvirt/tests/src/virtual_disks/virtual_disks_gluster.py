@@ -4,6 +4,7 @@ import logging
 from avocado.utils import process
 
 from virttest import virsh
+from virttest import data_dir
 from virttest import utils_misc
 from virttest import virt_vm, remote
 from virttest.utils_test import libvirt
@@ -102,7 +103,7 @@ def run(test, params, env):
             vm.wait_for_login()
         # Create swap partition if nessesary.
         if not vm.has_swap():
-            swap_path = os.path.join(test.tmpdir, 'swap.img')
+            swap_path = os.path.join(data_dir.get_tmp_dir(), 'swap.img')
             vm.create_swap_partition(swap_path)
         ret = virsh.dompmsuspend(vm_name, "disk", **virsh_dargs)
         libvirt.check_exit_status(ret)
@@ -116,7 +117,7 @@ def run(test, params, env):
         # Prepare guest agent and start guest
         try:
             vm.prepare_guest_agent()
-        except (remote.LoginError, virt_vm.VMError), detail:
+        except (remote.LoginError, virt_vm.VMError) as detail:
             test.fail("failed to prepare agent:\n%s" % detail)
 
         #TODO This step may hang for rhel6 guest
@@ -226,7 +227,7 @@ def run(test, params, env):
             # Makesure the guest agent is started
             try:
                 vm.prepare_guest_agent()
-            except (remote.LoginError, virt_vm.VMError), detail:
+            except (remote.LoginError, virt_vm.VMError) as detail:
                 test.fail("failed to prepare agent: %s" % detail)
             # Run dompmsuspend command.
             test_pmsuspend(vm_name)

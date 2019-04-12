@@ -91,7 +91,7 @@ class VMChecker(object):
         Compare virt-v2v version against given version.
         """
         cmd = 'rpm -q virt-v2v|grep virt-v2v'
-        v2v_version = LooseVersion(process.run(cmd, shell=True).stdout.strip())
+        v2v_version = LooseVersion(process.run(cmd, shell=True).stdout_text.strip())
         compare_version = LooseVersion(compare_version)
         if v2v_version > compare_version:
             return True
@@ -101,7 +101,9 @@ class VMChecker(object):
         """
         The graphic type in VM XML is different for different target.
         """
-        graphic_type = 'vnc'
+        # 'ori_graphic' only can be set when hypervior is KVM. For Xen and
+        # Esx, it will always be 'None' and 'vnc' will be set by default.
+        graphic_type = self.params.get('ori_graphic', 'vnc')
         # Video modle will change to QXL if convert target is ovirt/RHEVM
         if self.target == 'ovirt':
             graphic_type = 'spice'
@@ -169,7 +171,7 @@ class VMChecker(object):
         try:
             os_version = re.search(r'(\d\.?\d?)', os_info).group(1).split('.')
             dist_major = int(os_version[0])
-        except Exception, e:
+        except Exception as e:
             err_msg = "Fail to get OS distribution: %s" % e
             self.log_err(err_msg)
         if dist_major < 4:
@@ -212,9 +214,21 @@ class VMChecker(object):
 
         # 5. Check virtio disk partition
         logging.info("Checking virtio disk partition in device map")
-        if not self.checker.get_grub_device():
+        if self.checker.is_uefi_guest():
+            logging.info("The guest is uefi mode,skip the checkpoint")
+        elif not self.checker.get_grub_device():
             err_msg = "Not find vd? in disk partition"
-            self.log_err(err_msg)
+            if self.hypervisor != 'kvm':
+                self.log_err(err_msg)
+            else:
+                # Just warning the err if converting from KVM. It may
+                # happen that disk's bus type in xml is not the real bus
+                # type be used when preparing the image. Ex, if the image
+                # is installed with IDE, then you import the image with
+                # bus virtio, the device.map file will be inconsistent with
+                # the xml.
+                # V2V doesn't modify device.map file for this scenario.
+                logging.warning(err_msg)
         else:
             logging.info("PASS")
 
@@ -230,10 +244,15 @@ class VMChecker(object):
         vm_xorg_log = self.checker.get_vm_xorg()
         if vm_xorg_log:
             if expect_video not in vm_xorg_log:
-                err_msg = "Not find %s in Xorg log", expect_video
-                self.log_err(err_msg)
-            else:
-                logging.info("PASS")
+                err_msg = "Not find %s in Xorg log" % expect_video
+                logging.info(err_msg)
+                # RHEL8 desn't include any qxl string in xorg log.
+                # If expect_video is in lspci output, we think it passed.
+                if re.search(expect_video, pci_devs, re.IGNORECASE) is None:
+                    err_msg += " And Not find %s device by lspci" % expect_video
+                    self.log_err(err_msg)
+                    return
+            logging.info("PASS")
         else:
             logging.warning("Xorg log file not exist, skip checkpoint")
 
@@ -241,10 +260,9 @@ class VMChecker(object):
         """
         Check windows guest after v2v convert.
         """
-        # Make sure windows boot up successfully first
-        self.checker.boot_windows()
         try:
-            self.checker.create_session()
+            # Sometimes windows guests needs >10mins to finish drivers installation
+            self.checker.create_session(timeout=900)
         except Exception as detail:
             raise exceptions.TestError('Failed to connect to windows guest: %s' %
                                        detail)
@@ -272,7 +290,6 @@ class VMChecker(object):
 
         # 2. Check Red Hat VirtIO drivers and display adapter
         logging.info("Checking VirtIO drivers and display adapter")
-        win_dirves = self.checker.get_driver_info()
         expect_drivers = ["Red Hat VirtIO SCSI",
                           "Red Hat VirtIO Ethernet Adapte"]
         # Windows display adapter is different for each release
@@ -280,16 +297,31 @@ class VMChecker(object):
             expect_adapter = 'QXL'
         if self.os_version in ['win2003', 'win2008']:
             expect_adapter = 'Standard VGA Graphics Adapter'
-        if self.os_version in ['win8', 'win8.1', 'win10', 'win2012', 'win2012r2', 'win2016']:
+        bdd_list = ['win8', 'win8.1', 'win10', 'win2012', 'win2012r2', 'win2016', 'win2019']
+        if self.os_version in bdd_list:
             expect_adapter = 'Basic Display Driver'
         expect_drivers.append(expect_adapter)
-        for driver in expect_drivers:
-            if driver in win_dirves:
-                logging.info("Find driver: %s", driver)
-                logging.info("PASS")
+        check_drivers = expect_drivers[:]
+        for check_times in range(5):
+            logging.info('Check drivers for the %dth time', check_times + 1)
+            win_dirves = self.checker.get_driver_info()
+            for driver in expect_drivers:
+                if driver in win_dirves:
+                    logging.info("Driver %s found", driver)
+                    check_drivers.remove(driver)
+                else:
+                    err_msg = "Driver %s not found" % driver
+                    logging.error(err_msg)
+            expect_drivers = check_drivers[:]
+            if not expect_drivers:
+                break
             else:
-                err_msg = "Not find driver: %s" % driver
-                self.log_err(err_msg)
+                wait = 60
+                logging.info('Wait another %d seconds...', wait)
+                time.sleep(wait)
+        if expect_drivers:
+            for driver in expect_drivers:
+                self.log_err("Not find driver: %s" % driver)
 
         # 3. Check graphic and video type in VM XML
         if self.compare_version(V2V_7_3_VERSION):

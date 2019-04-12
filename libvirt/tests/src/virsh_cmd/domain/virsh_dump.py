@@ -1,16 +1,18 @@
 import os
 import logging
-import commands
+import multiprocessing
 import time
-import signal
+import platform
 
 from avocado.utils import process
 
 from virttest import virsh
 from virttest import utils_libvirtd
 from virttest import utils_config
-from virttest.libvirt_xml import vm_xml
 from virttest import data_dir
+from virttest import utils_package
+from virttest.libvirt_xml import vm_xml
+
 
 from provider import libvirt_version
 
@@ -41,7 +43,7 @@ def run(test, params, env):
     start_vm = params.get("start_vm") == "yes"
     paused_after_start_vm = params.get("paused_after_start_vm") == "yes"
     status_error = params.get("status_error", "no") == "yes"
-    timeout = int(params.get("check_pid_timeout", "5"))
+    check_bypass_timeout = int(params.get("check_bypass_timeout", "120"))
     memory_dump_format = params.get("memory_dump_format", "")
     uri = params.get("virsh_uri")
     unprivileged_user = params.get('unprivileged_user')
@@ -54,70 +56,65 @@ def run(test, params, env):
             test.cancel("API acl test not supported in current"
                         " libvirt version.")
 
-    def wait_pid_active(pid, timeout=5):
-        """
-        Wait for pid in running status
-
-        :param: pid: Desired pid
-        :param: timeout: Max time we can wait
-        """
-        cmd = ("cat /proc/%d/stat | awk '{print $3}'" % pid)
-        try:
-            while (True):
-                timeout = timeout - 1
-                if not timeout:
-                    test.cancel("Time out for waiting pid!")
-                pid_status = process.run(cmd, ignore_status=False, shell=True).stdout.strip()
-                if pid_status != "R":
-                    time.sleep(1)
-                    continue
-                else:
-                    break
-        except Exception, detail:
-            test.fail(detail)
-
-    def check_flag(file_flag):
+    def check_flag(file_flags):
         """
         Check if file flag include O_DIRECT.
 
-        Note, O_DIRECT is defined as:
-        #define O_DIRECT        00040000        /* direct disk access hint */
+        :param file_flags: The flags of dumped file
+
+        Note, O_DIRECT(direct disk access hint) is defined as:
+        on x86_64:
+        #define O_DIRECT        00040000
+        on ppc64le or arch64:
+        #define O_DIRECT        00200000
         """
-        if int(file_flag) == 4:
+        arch = platform.machine()
+        file_flag_check = int('00040000', 16)
+        if 'ppc64' in arch or 'aarch64' in arch:
+            file_flag_check = int('00200000', 16)
+
+        if int(file_flags, 16) & file_flag_check == file_flag_check:
             logging.info("File flags include O_DIRECT")
             return True
         else:
             logging.error("File flags doesn't include O_DIRECT")
             return False
 
-    def check_bypass(dump_file):
+    def check_bypass(dump_file, result_dict):
         """
         Get the file flags of domain core dump file and check it.
         """
-
+        error = ''
         cmd1 = "lsof -w %s" % dump_file
         while True:
             if not os.path.exists(dump_file) or process.system(cmd1):
+                time.sleep(0.1)
                 continue
             cmd2 = ("cat /proc/$(%s |awk '/libvirt_i/{print $2}')/fdinfo/1"
                     "|grep flags|awk '{print $NF}'" % cmd1)
-            (status, output) = commands.getstatusoutput(cmd2)
+            ret = process.run(cmd2, allow_output_check='combined', shell=True)
+            status, output = ret.exit_status, ret.stdout_text.strip()
             if status:
-                test.fail("Fail to get the flags of dumped file")
+                error = "Fail to get the flags of dumped file"
+                logging.error(error)
+                break
             if not len(output):
                 continue
             try:
                 logging.debug("The flag of dumped file: %s", output)
-                file_flag = output[-5]
-                if check_flag(file_flag):
+                if check_flag(output):
                     logging.info("Bypass file system cache "
                                  "successfully when dumping")
                     break
                 else:
-                    test.fail("Bypass file system cache "
-                              "fail when dumping")
-            except (ValueError, IndexError), detail:
-                test.fail(detail)
+                    error = "Bypass file system cache fail when dumping"
+                    logging.error(error)
+                    break
+            except (ValueError, IndexError) as detail:
+                error = detail
+                logging.error(error)
+                break
+        result_dict['bypass'] = error
 
     def check_domstate(actual, options):
         """
@@ -168,7 +165,8 @@ def run(test, params, env):
             return True
         else:
             file_cmd = "file %s" % dump_file
-            (status, output) = commands.getstatusoutput(file_cmd)
+            ret = process.run(file_cmd, allow_output_check='combined', shell=True)
+            status, output = ret.exit_status, ret.stdout_text.strip()
             if status:
                 logging.error("Fail to check dumped file %s", dump_file)
                 return False
@@ -184,6 +182,11 @@ def run(test, params, env):
     # Configure dump_image_format in /etc/libvirt/qemu.conf.
     qemu_config = utils_config.LibvirtQemuConfig()
     libvirtd = utils_libvirtd.Libvirtd()
+
+    # Install lsof pkg if not installed
+    if not utils_package.package_install("lsof"):
+        test.cancel("Failed to install lsof in host\n")
+
     if len(dump_image_format):
         qemu_config.dump_image_format = dump_image_format
         libvirtd.restart()
@@ -226,7 +229,7 @@ def run(test, params, env):
             cmd = "cat /proc/%d/cmdline|xargs -0 echo" % vm_pid
             cmd += "|grep dump-guest-core=%s" % dump_guest_core
             result = process.run(cmd, ignore_status=True, shell=True)
-            logging.debug("cmdline: %s" % result.stdout)
+            logging.debug("cmdline: %s" % result.stdout_text)
             if result.exit_status:
                 test.fail("Not find dump-guest-core=%s in qemu cmdline"
                           % dump_guest_core)
@@ -235,19 +238,12 @@ def run(test, params, env):
                              dump_guest_core)
 
         # Deal with bypass-cache option
-        child_pid = 0
         if options.find('bypass-cache') >= 0:
             vm.wait_for_login()
-            pid = os.fork()
-            if pid:
-                # Guarantee check_bypass function has run before dump
-                child_pid = pid
-                wait_pid_active(pid, timeout)
-            else:
-                check_bypass(dump_file)
-                # Wait for parent process kills us
-                while True:
-                    time.sleep(1)
+            result_dict = multiprocessing.Manager().dict()
+            child_process = multiprocessing.Process(target=check_bypass,
+                                                    args=(dump_file, result_dict))
+            child_process.start()
 
         # Run virsh command
         cmd_result = virsh.dump(vm_name, dump_file, options,
@@ -255,6 +251,9 @@ def run(test, params, env):
                                 uri=uri,
                                 ignore_status=True, debug=True)
         status = cmd_result.exit_status
+        if 'child_process' in locals():
+            child_process.join(timeout=check_bypass_timeout)
+            params['bypass'] = result_dict['bypass']
 
         logging.info("Start check result")
         if not check_domstate(vm.state(), options):
@@ -271,11 +270,11 @@ def run(test, params, env):
                 logging.info("Successfully dump domain to %s", dump_file)
             else:
                 test.fail("The format of dumped file is wrong.")
+        if params.get('bypass'):
+            test.fail(params['bypass'])
     finally:
         backup_xml.sync()
         qemu_config.restore()
         libvirtd.restart()
-        if child_pid:
-            os.kill(child_pid, signal.SIGKILL)
         if os.path.isfile(dump_file):
             os.remove(dump_file)

@@ -5,13 +5,12 @@ import subprocess
 import time
 import shutil
 
-from autotest.client.shared import error
-
 from virttest import virsh
 from virttest import libvirt_vm
 from virttest import utils_test
 from virttest import utils_misc
 from virttest.utils_test import libvirt as utlv
+from virttest import data_dir
 
 
 def run(test, params, env):
@@ -27,7 +26,7 @@ def run(test, params, env):
     test_count = int(params.get("test_count", 5))
     test_type = params.get("test_type", "multi")
 
-    tmp_dir = os.path.join(test.tmpdir, "hotplug_serial_load")
+    tmp_dir = os.path.join(data_dir.get_tmp_dir(), "hotplug_serial_load")
     if not os.path.exists(tmp_dir):
         os.mkdir(tmp_dir)
     os.chmod(tmp_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
@@ -96,15 +95,14 @@ def run(test, params, env):
         chardev_c = h_o.count("chardev = %s%s" % (char_dev, index))
         name_c = h_o.count("name = \"%s%s\"" % (char_dev, index))
         if chardev_c == 0 and name_c == 0:
-            raise error.TestFail("Cannot get serial device info: '%s'" % h_o)
+            test.fail("Cannot get serial device info: '%s'" % h_o)
 
         tmp_file = "%s/%s%s" % (tmp_dir, char_dev, index)
         serial_file = "/dev/virtio-ports/%s%s" % (char_dev, index)
         if char_dev == "file":
             session.cmd("echo test > %s" % serial_file)
-            f = open(tmp_file, "r")
-            output = f.read()
-            f.close()
+            with open(tmp_file, "r") as f:
+                output = f.read()
         elif char_dev == "socket":
             session.cmd("echo test > /tmp/file")
             sock = socket.socket(socket.AF_UNIX)
@@ -117,9 +115,10 @@ def run(test, params, env):
             session.cmd("dd if=/tmp/file of=%s &" % serial_file)
             dev_file = "/dev/pts/%s" % id
             if not os.path.exists(dev_file):
-                raise error.TestFail("%s doesn't exist." % dev_file)
+                test.fail("%s doesn't exist." % dev_file)
             p = subprocess.Popen(["/usr/bin/cat", dev_file],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 universal_newlines=True)
             while True:
                 output = p.stdout.readline()
                 if output or p.poll():
@@ -128,7 +127,7 @@ def run(test, params, env):
             p.kill()
         if not output.count("test"):
             err_info = "%s device file doesn't match 'test':%s" % (char_dev, output)
-            raise error.TestFail(err_info)
+            test.fail(err_info)
 
     def unhotplug_serial_device(hotplug_type, char_dev, index=1):
         if hotplug_type == "qmp":
@@ -145,17 +144,17 @@ def run(test, params, env):
         result = virsh.qemu_monitor_command(vm_name, "info qtree", "--hmp")
         uh_o = result.stdout.strip()
         if uh_o.count("chardev = %s%s" % (char_dev, index)):
-            raise error.TestFail("Still can get serial device info: '%s'" % uh_o)
+            test.fail("Still can get serial device info: '%s'" % uh_o)
         if not session.cmd_status("test -e %s" % serial_file):
-            raise error.TestFail("File '%s' still exists after unhotplug" % serial_file)
+            test.fail("File '%s' still exists after unhotplug" % serial_file)
 
     # run test case
     try:
         # increase workload
         if load_type in ['cpu', 'memory']:
-            utils_test.load_stress("stress_in_vms", load_vms, params)
+            utils_test.load_stress("stress_in_vms", params=params, vms=load_vms)
         else:
-            utils_test.load_stress("iozone_in_vms", load_vms, params)
+            utils_test.load_stress("iozone_in_vms", params=params, vms=load_vms)
 
         if test_type == "multi":
             for i in range(test_count):

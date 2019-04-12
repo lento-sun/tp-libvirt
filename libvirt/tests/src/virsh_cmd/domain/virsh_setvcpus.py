@@ -2,36 +2,11 @@ import re
 import os
 import logging
 
-from avocado.utils import process
-from virttest import remote
+from virttest import ssh_key
+from virttest import data_dir
 from virttest import virsh
-from virttest import libvirt_vm
 from virttest.libvirt_xml import vm_xml
 from virttest import utils_hotplug
-
-
-def remote_test(remote_ip, local_ip, remote_pwd, remote_prompt,
-                vm_name, status_error_test):
-    """
-    Test remote case
-    """
-    err = ""
-    status = 1
-    status_error = status_error_test
-    try:
-        remote_uri = libvirt_vm.complete_uri(local_ip)
-        session = remote.remote_login("ssh", remote_ip, "22",
-                                      "root", remote_pwd, remote_prompt)
-        session.cmd_output('LANG=C')
-        command = "virsh -c %s setvcpus %s 1 --live" % (remote_uri, vm_name)
-        status, output = session.cmd_status_output(command, internal_timeout=5)
-        session.close()
-        if status != 0:
-            err = output
-    except process.CmdError:
-        status = 1
-        err = "remote test failed"
-    return status, status_error, err
 
 
 def run(test, params, env):
@@ -73,20 +48,18 @@ def run(test, params, env):
     extra_param = params.get("setvcpus_extra_param")
     count_option = "%s %s" % (count, extra_param)
     remote_ip = params.get("remote_ip", "REMOTE.EXAMPLE.COM")
-    local_ip = params.get("local_ip", "LOCAL.EXAMPLE.COM")
     remote_pwd = params.get("remote_pwd", "")
-    remote_prompt = params.get("remote_prompt", "#")
-    tmpxml = os.path.join(test.tmpdir, 'tmp.xml')
-    set_topology = (params.get("set_topology", "no") == "yes")
-    sockets = params.get("sockets")
-    cores = params.get("cores")
-    threads = params.get("threads")
+    remote_user = params.get("remote_user", "root")
+    remote_uri = params.get("remote_uri")
+    tmpxml = os.path.join(data_dir.get_tmp_dir(), 'tmp.xml')
+    topology_correction = "yes" == params.get("topology_correction", "yes")
     result = True
 
     # Early death 1.1
-    if vm_ref == "remote" and (remote_ip.count("EXAMPLE.COM") or
-                               local_ip.count("EXAMPLE.COM")):
-        test.cancel("remote/local ip parameters not set.")
+    if remote_uri:
+        if remote_ip.count("EXAMPLE.COM"):
+            test.cancel("remote ip parameters not set.")
+        ssh_key.setup_ssh_key(remote_ip, remote_user, remote_pwd)
 
     # Early death 1.2
     option_list = options.split(" ")
@@ -146,17 +119,13 @@ def run(test, params, env):
         # Set maximum vcpus, so we can run all kinds of normal tests without
         # encounter requested vcpus greater than max allowable vcpus error
         topology = vmxml.get_cpu_topology()
-        if all([topology, sockets, cores, threads]) or set_topology:
-            vmxml.set_vm_vcpus(vm_name, max_vcpu, current_vcpu,
-                               sockets, cores, threads, True)
-        else:
-            vmxml.set_vm_vcpus(vm_name, max_vcpu, current_vcpu)
-
         if topology and ("config" and "maximum" in options) and not status_error:
             # https://bugzilla.redhat.com/show_bug.cgi?id=1426220
             vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
             del vmxml.cpu
             vmxml.sync()
+        vmxml.set_vm_vcpus(vm_name, max_vcpu, current_vcpu,
+                           topology_correction=topology_correction)
 
         vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
         logging.debug("Pre-test xml is %s", vmxml.xmltreefile)
@@ -185,38 +154,33 @@ def run(test, params, env):
             vm.destroy()
 
         # Run test
-        if vm_ref == "remote":
-            (setvcpu_exit_status, status_error,
-             setvcpu_exit_stderr) = remote_test(remote_ip,
-                                                local_ip,
-                                                remote_pwd,
-                                                remote_prompt,
-                                                vm_name,
-                                                status_error)
+        if vm_ref == "name":
+            dom_option = vm_name
+        elif vm_ref == "id":
+            dom_option = domid
+            if params.get("setvcpus_hex_id") is not None:
+                dom_option = hex(int(domid))
+            elif params.get("setvcpus_invalid_id") is not None:
+                dom_option = params.get("setvcpus_invalid_id")
+        elif vm_ref == "uuid":
+            dom_option = domuuid
+            if params.get("setvcpus_invalid_uuid") is not None:
+                dom_option = params.get("setvcpus_invalid_uuid")
         else:
-            if vm_ref == "name":
-                dom_option = vm_name
-            elif vm_ref == "id":
-                dom_option = domid
-                if params.get("setvcpus_hex_id") is not None:
-                    dom_option = hex(int(domid))
-                elif params.get("setvcpus_invalid_id") is not None:
-                    dom_option = params.get("setvcpus_invalid_id")
-            elif vm_ref == "uuid":
-                dom_option = domuuid
-                if params.get("setvcpus_invalid_uuid") is not None:
-                    dom_option = params.get("setvcpus_invalid_uuid")
-            else:
-                dom_option = vm_ref
+            dom_option = vm_ref
 
+        if remote_uri:
+            status = virsh.setvcpus(dom_option, "1", "--config",
+                                    ignore_status=True, debug=True, uri=remote_uri)
+        else:
             status = virsh.setvcpus(dom_option, count_option, options,
                                     ignore_status=True, debug=True)
             if not status_error:
                 set_expected(vm, options)
                 result = utils_hotplug.check_vcpu_value(vm, exp_vcpu,
                                                         option=options)
-            setvcpu_exit_status = status.exit_status
-            setvcpu_exit_stderr = status.stderr.strip()
+        setvcpu_exit_status = status.exit_status
+        setvcpu_exit_stderr = status.stderr.strip()
 
     finally:
         cpu_xml_data = utils_hotplug.get_cpu_xmldata(vm, options)

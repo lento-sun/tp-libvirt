@@ -13,6 +13,7 @@ from virttest import libvirt_xml
 from virttest.utils_test import libvirt
 from virttest.libvirt_xml.devices.interface import Interface
 from virttest.libvirt_xml.devices.disk import Disk
+from virttest.compat_52lts import decode_to_text as to_text
 
 
 def run(test, params, env):
@@ -68,7 +69,7 @@ def run(test, params, env):
                 test.cancel("block partition is not given")
             # Check if valid partition or raise
             cmd = "blkid /dev/%s|awk -F" " '{print $2}'" % blk_partition
-            output = process.system_output(cmd, shell=True)
+            output = to_text(process.system_output(cmd, shell=True))
             if "UUID" not in output:
                 test.cancel("Not a valid partition given for swap creation")
             # Create swap partition
@@ -149,8 +150,8 @@ def run(test, params, env):
         logging.debug("VM XML: \n%s", vmxml)
         try:
             vm.start()
-        except virt_vm.VMStartError, detail:
-            for msg in failures.items():
+        except virt_vm.VMStartError as detail:
+            for msg in list(failures.items()):
                 if msg[0] in detail:
                     test.cancel("%s", msg[1])
             test.fail("%s" % detail)

@@ -2,11 +2,8 @@ import logging
 import os
 import re
 
-from autotest.client.shared import error
-from autotest.client.shared import utils
-
+from avocado.utils import process
 from avocado.utils import path as utils_path
-
 from virttest import virsh
 
 from provider import libvirt_version
@@ -43,9 +40,9 @@ def get_storage_devices():
                 'Storage device path %s doesn`t exists!', storage_path)
             return []
         for device in os.listdir(storage_path):
-            info = utils.run(
-                'udevadm info %s' % os.path.join(storage_path, device),
-                timeout=5, ignore_status=True).stdout
+            info = process.run(
+                               'udevadm info %s' % os.path.join(storage_path, device),
+                               timeout=5, ignore_status=True, shell=True).stdout_text
             # Only disk devices are list, not partition
             dev_type = re.search(r'(?<=E: DEVTYPE=)\S*', info)
             dev_real_virtual = re.search(r'P: /devices/virtual', info)
@@ -91,11 +88,10 @@ def get_net_devices():
                     continue
                 address_file = os.path.join(dev_dir, 'address')
                 mac = ''
-                f_addr = open(address_file, 'r')
-                mac = f_addr.read().strip()
-                f_addr.close()
+                with open(address_file, 'r') as f_addr:
+                    mac = f_addr.read().strip()
             except IOError:
-                print 'Cannot get address for device %s' % device
+                print('Cannot get address for device %s' % device)
             if mac:
                 dev_name = re.sub(r'\W', '_', 'net_%s_%s' % (device, mac))
             else:
@@ -196,8 +192,8 @@ def run(test, params, env):
 
     if not libvirt_version.version_compare(1, 1, 1):
         if params.get('setup_libvirt_polkit') == 'yes':
-            raise error.TestNAError("API acl test not supported in current"
-                                    " libvirt version.")
+            test.cancel("API acl test not supported in current"
+                        " libvirt version.")
 
     virsh_dargs = {}
     if params.get('setup_libvirt_polkit') == 'yes':
@@ -221,7 +217,7 @@ def run(test, params, env):
                 break
             elif result.exit_status == 0 and expect_succeed == 'no':
                 break
-            if not _check_result(cap, devices[cap], result.stdout):
+            if not _check_result(cap, devices[cap], result.stdout.strip()):
                 check_failed = True
                 break
     else:
@@ -238,11 +234,11 @@ def run(test, params, env):
     logging.debug(result)
     if expect_succeed == 'yes':
         if result.exit_status != 0:
-            raise error.TestFail(
+            test.fail(
                 'Expected succeed, but failed with result:\n%s' % result)
     elif expect_succeed == 'no':
         if result.exit_status == 0:
-            raise error.TestFail(
+            test.fail(
                 'Expected fail, but succeed with result:\n%s' % result)
     if check_failed:
-        raise error.TestFail('Check failed. result:\n%s' % result)
+        test.fail('Check failed. result:\n%s' % result)

@@ -1,7 +1,5 @@
 import logging
 
-from autotest.client.shared import error
-
 from avocado.utils import path as utils_path
 
 from virttest import libvirt_xml
@@ -65,7 +63,7 @@ def check_numatune_xml(params):
     return True
 
 
-def get_numa_parameter(params, cgstop):
+def get_numa_parameter(test, params, cgstop):
     """
     Get the numa parameters
     :params: the parameter dictionary
@@ -86,18 +84,18 @@ def get_numa_parameter(params, cgstop):
             # If we stopped control groups, then we expect a different
             # result in this failure case; however, if there were no
             # control groups to stop, then don't error needlessly
-            if cgstop:
-                raise error.TestFail("Unexpected return code %d" % status)
+            if not cgstop:
+                test.fail("Unexpected return code %d" % status)
             else:
                 logging.info("Control groups stopped, thus expected success")
     elif status_error == "no":
         if status:
-            raise error.TestFail(result.stderr)
+            test.fail(result.stderr)
         else:
-            logging.info(result.stdout)
+            logging.info(result.stdout.strip())
 
 
-def set_numa_parameter(params, cgstop):
+def set_numa_parameter(test, params, cgstop):
     """
     Set the numa parameters
     :params: the parameter dictionary
@@ -114,6 +112,13 @@ def set_numa_parameter(params, cgstop):
     node_list = host_numa_node.online_nodes_withmem
     logging.debug("host online nodes with memory %s", node_list)
 
+    # Get original numatune memory mode
+    ori_mode = ''
+    ori_numatune = {}
+    if libvirt_xml.VMXML.new_from_dumpxml(vm_name).xmltreefile.find('numatune'):
+        ori_numatune = libvirt_xml.VMXML.get_numa_memory_params(vm_name)
+        ori_mode = ori_numatune['mode'] if 'mode' in ori_numatune else ''
+
     # Don't use libvirt_xml here because testing numatune command
     result = virsh.numatune(vm_name, mode, nodeset, options, debug=True)
     status = result.exit_status
@@ -122,9 +127,14 @@ def set_numa_parameter(params, cgstop):
     status_error = params.get("status_error", "no")
 
     # For a running domain, the mode can't be changed, and the nodeset can
-    # be changed only the domain was started with a mode of 'strict'
+    # be changed only the domain was started with a mode of 'strict' which
+    # should be the same with original mode
+    if ori_mode == mode and (ori_numatune.get('nodeset') == nodeset or not nodeset):
+        status_error = "no"
     if mode == "strict" and start_vm == "yes":
         status_error = "no"
+    if ori_mode and ori_mode != mode and start_vm == "yes":
+        status_error = "yes"
 
     # TODO, the '--config' option will affect next boot, and if the guest
     # is shutoff status, the '--current' option will be equivalent to
@@ -142,24 +152,24 @@ def set_numa_parameter(params, cgstop):
             # If we stopped control groups, then we expect a different
             # result in this failure case; however, if there were no
             # control groups to stop, then don't error needlessly
-            if cgstop:
-                raise error.TestFail("Unexpected return code %d" % status)
+            if not cgstop:
+                test.fail("Unexpected return code %d" % status)
             else:
                 logging.info("Control groups stopped, thus expected success")
     elif status_error == "no":
         if status:
             used_node = cpus_parser(nodeset)
             if not set(used_node).issubset(node_list):
-                raise error.TestNAError("Host does not support requested"
-                                        " nodeset %s" % used_node)
+                test.cancel("Host does not support requested"
+                            " nodeset %s" % used_node)
             else:
-                raise error.TestFail(result.stderr)
+                test.fail(result.stderr)
         else:
             if check_numatune_xml(params):
-                logging.info(result.stdout)
+                logging.info(result.stdout.strip())
             else:
-                raise error.TestFail("The 'mode' or/and 'nodeset' are"
-                                     " inconsistent with numatune XML")
+                test.fail("The 'mode' or/and 'nodeset' are"
+                          " inconsistent with numatune XML")
 
 
 def run(test, params, env):
@@ -187,8 +197,8 @@ def run(test, params, env):
     try:
         utils_path.find_command("numactl")
     except utils_path.CmdNotFoundError:
-        raise error.TestNAError("Command 'numactl' is missing. You must "
-                                "install it.")
+        test.cancel("Command 'numactl' is missing. You must "
+                    "install it.")
 
     # Run test case
     vm_name = params.get("main_vm")
@@ -211,9 +221,9 @@ def run(test, params, env):
     try:
         if status_error == "no":
             if change_parameters == "no":
-                get_numa_parameter(params, cgstop)
+                get_numa_parameter(test, params, cgstop)
             else:
-                set_numa_parameter(params, cgstop)
+                set_numa_parameter(test, params, cgstop)
         if cgconfig == "off":
             # If running, then need to shutdown a running guest before
             # stopping cgconfig service and will start the guest after
@@ -222,7 +232,7 @@ def run(test, params, env):
                 if vm.is_alive():
                     vm.destroy()
                 cg.cgconfig_stop()
-                cgstop = True
+            cgstop = True
 
         # If we stopped cg, then refresh libvirtd service
         # to get latest cgconfig service change; otherwise,
@@ -234,7 +244,7 @@ def run(test, params, env):
                 # Not running is not a good thing, but it does happen
                 # and it will affect other tests
                 if not utils_libvirtd.libvirtd_is_running():
-                    raise error.TestNAError("libvirt service is not running!")
+                    test.cancel("libvirt service is not running!")
 
         # Recover previous running guest
         if (cgconfig == "off" and libvirtd == "restart" and
@@ -242,9 +252,9 @@ def run(test, params, env):
             vm.start()
         if status_error == "yes":
             if change_parameters == "no":
-                get_numa_parameter(params, cgstop)
+                get_numa_parameter(test, params, cgstop)
             else:
-                set_numa_parameter(params, cgstop)
+                set_numa_parameter(test, params, cgstop)
     finally:
         # Restore guest
         original_vm_xml.sync()

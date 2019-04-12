@@ -2,11 +2,11 @@ import re
 import os
 import logging
 
-from autotest.client.shared import error
-from autotest.client import utils
+from avocado.utils import process
 
 from virttest import virsh
 from virttest import utils_libvirtd
+from virttest.compat_52lts import decode_to_text as to_text
 
 
 def run(test, params, env):
@@ -107,7 +107,7 @@ def run(test, params, env):
                  vm's information.
         """
         pid = vm.get_pid()
-        cmdline_tmp = utils.system_output("cat -v /proc/%d/cmdline" % pid)
+        cmdline_tmp = to_text(process.system_output("cat -v /proc/%d/cmdline" % pid, shell=True))
 
         # Output has a trailing '^@' which gets converted into an empty
         # element when spliting by '\x20', so strip it on the end.
@@ -118,10 +118,22 @@ def run(test, params, env):
         # do the same if we find "/usr/bin/qemu-kvm" in the incoming
         # argument list and we find "qemu-system-x86_64 -machine accel=kvm"
         # in the running guest's cmdline
-        if conv_arg.find("/usr/bin/qemu-kvm") != 1 and \
-                cmdline.find("/usr/bin/qemu-system-x86_64 -machine accel=kvm") != -1:
-            cmdline = re.sub(r"/usr/bin/qemu-system-x86_64 -machine accel=kvm",
-                             "/usr/bin/qemu-kvm", cmdline)
+        # ubuntu use /usr/bin/kvm as qemu binary
+        qemu_bin = ["/usr/bin/qemu-kvm", "/usr/bin/kvm"]
+        arch_bin = ["/usr/bin/qemu-system-x86_64 -machine accel=kvm",
+                    "/usr/bin/qemu-system-ppc64 -machine accel=kvm",
+                    "qemu-system-ppc64 -enable-kvm"]
+        qemu_kvm_bin = ""
+        for each_bin in qemu_bin:
+            if conv_arg.find(each_bin) != -1:
+                qemu_kvm_bin = each_bin
+        if qemu_kvm_bin:
+            for arch in arch_bin:
+                if cmdline.find(arch) != -1:
+                    cmdline = re.sub(arch, qemu_kvm_bin, cmdline)
+        else:
+            logging.warning("qemu-kvm binary is not identified: '%s'",
+                            qemu_kvm_bin)
 
         # Now prepend the various environment variables that will be in
         # the conv_arg, but not in the actual command
@@ -152,17 +164,46 @@ def run(test, params, env):
 
         return True
 
-    # run test case
+    # prepare
+    vm_name = params.get("main_vm")
+    vm = env.get_vm(vm_name)
+
+    if not vm.is_dead():
+        vm.destroy()
+    vm.start()
+    if not vm.is_alive():
+        test.fail("VM start failed")
+
+    domid = vm.get_id()
+    domuuid = vm.get_uuid()
+
     dtn_format = params.get("dtn_format")
-    file_xml = params.get("dtn_file_xml")
+    file_xml = params.get("dtn_file_xml", "")
     extra_param = params.get("dtn_extra_param")
+    extra = params.get("dtn_extra", "")
     libvirtd = params.get("libvirtd")
-    status_error = params.get("status_error")
+    status_error = params.get("status_error", "no")
+    vm_id = params.get("dtn_vm_id", "")
+    readonly = ("yes" == params.get("readonly", "no"))
+
+    # For positive_test
+    if status_error == "no":
+        if vm_id == "id":
+            vm_id = domid
+        elif vm_id == "uuid":
+            vm_id = domuuid
+        elif vm_id == "name":
+            vm_id = "%s %s" % (vm_name, extra)
+        if file_xml == "":
+            extra_param = extra_param + vm_id
+
     virsh.dumpxml(vm_name, extra="", to_file=file_xml)
     if libvirtd == "off":
         utils_libvirtd.libvirtd_stop()
-    ret = virsh.domxml_to_native(dtn_format, file_xml, extra_param,
-                                 ignore_status=True)
+
+    # run test case
+    ret = virsh.domxml_to_native(dtn_format, file_xml, extra_param, readonly=readonly,
+                                 ignore_status=True, debug=True)
     status = ret.exit_status
     conv_arg = ret.stdout.strip()
 
@@ -177,9 +218,9 @@ def run(test, params, env):
     # check status_error
     if status_error == "yes":
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
     elif status_error == "no":
         if status != 0:
-            raise error.TestFail("Run failed with right command")
+            test.fail("Run failed with right command")
         if compare(conv_arg) is not True:
-            raise error.TestFail("Test failed!")
+            test.fail("Test failed!")

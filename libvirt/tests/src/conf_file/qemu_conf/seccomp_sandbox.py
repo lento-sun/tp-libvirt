@@ -1,11 +1,12 @@
 import re
 import logging
 
-from autotest.client import utils
-from autotest.client.shared import error
+from avocado.utils import process
 
 from virttest import utils_config
 from virttest import utils_libvirtd
+
+from provider import libvirt_version
 
 
 def run(test, params, env):
@@ -30,16 +31,22 @@ def run(test, params, env):
 
         # Get qemu command line.
         pid = vm.get_pid()
-        res = utils.run("ps -p %s -o cmd h" % pid)
+        res = process.run("ps -p %s -o cmd h" % pid, shell=True)
 
         if res.exit_status == 0:
-            match = re.search(r'-sandbox\s*(\S*)', res.stdout)
+            match = re.search(r'-sandbox\s*(\S*)', res.stdout_text.strip())
             if match:
                 return match.groups()[0]
 
     vm_name = params.get("main_vm", "avocado-vt-vm1")
-    expected_result = params.get("expected_result", "not_set")
-    seccomp_sandbox = params.get("seccomp_sandbox", "not_set")
+    seccomp_sandbox = params.get("seccomp_sandbox", "")
+    default_value = "yes" == params.get("default_value", "no")
+    if libvirt_version.version_compare(3, 9, 0):
+        expected_result = params.get("expected_result", "on")
+        if expected_result == "on":
+            expected_result = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+    else:
+        expected_result = params.get("expected_result", "")
     vm = env.get_vm(vm_name)
 
     # Get old qemu -sandbox option.
@@ -50,22 +57,20 @@ def run(test, params, env):
     config = utils_config.LibvirtQemuConfig()
     libvirtd = utils_libvirtd.Libvirtd()
     try:
-        if seccomp_sandbox == 'not_set':
-            del config.seccomp_sandbox
-        else:
+        if not default_value:
             config.seccomp_sandbox = seccomp_sandbox
 
         # Restart libvirtd to make change valid.
         if not libvirtd.restart():
             if expected_result != 'unbootable':
-                raise error.TestFail('Libvirtd is expected to be started '
-                                     'with seccomp_sandbox = '
-                                     '%s' % seccomp_sandbox)
+                test.fail('Libvirtd is expected to be started '
+                          'with seccomp_sandbox = '
+                          '%s' % seccomp_sandbox)
             return
         if expected_result == 'unbootable':
-            raise error.TestFail('Libvirtd is not expected to be started '
-                                 'with seccomp_sandbox = '
-                                 '%s' % seccomp_sandbox)
+            test.fail('Libvirtd is not expected to be started '
+                      'with seccomp_sandbox = '
+                      '%s' % seccomp_sandbox)
 
         # Restart VM to create a new qemu command line.
         if vm.is_alive():
@@ -79,12 +84,12 @@ def run(test, params, env):
 
         if new_qemu_sandbox is None:
             if expected_result != 'not_set':
-                raise error.TestFail('Qemu sandbox option is expected to set '
-                                     'but %s found', new_qemu_sandbox)
+                test.fail('Qemu sandbox option is expected to set '
+                          'but %s found', new_qemu_sandbox)
         else:
             if expected_result != new_qemu_sandbox:
-                raise error.TestFail('Qemu sandbox option is expected to be '
-                                     '%s, but %s found' % (
+                test.fail('Qemu sandbox option is expected to be '
+                          '%s, but %s found' % (
                                          expected_result, new_qemu_sandbox))
     finally:
         config.restore()

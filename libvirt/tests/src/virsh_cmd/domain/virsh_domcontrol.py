@@ -1,9 +1,9 @@
 import os
 import subprocess
 
-from autotest.client.shared import error
-
 from virttest import virsh
+from virttest import data_dir
+from virttest import ssh_key
 
 
 def get_subprocess(action, vm_name, filepath):
@@ -44,13 +44,22 @@ def run(test, params, env):
     pre_vm_state = params.get("pre_vm_state", "running")
     options = params.get("domcontrol_options", "")
     action = params.get("domcontrol_action", "dump")
-    tmp_file = os.path.join(test.tmpdir, "domcontrol.tmp")
+    tmp_file = os.path.join(data_dir.get_tmp_dir(), "domcontrol.tmp")
     vm_ref = params.get("domcontrol_vm_ref")
     job = params.get("domcontrol_job", "yes")
     readonly = "yes" == params.get("readonly", "no")
     status_error = params.get("status_error", "no")
+    remote_uri = params.get("remote_uri")
+    remote_ip = params.get("remote_ip")
+    remote_pwd = params.get("remote_pwd")
+    remote_user = params.get("remote_user", "root")
     if start_vm == "no" and vm.is_alive():
         vm.destroy()
+
+    if remote_uri:
+        if remote_ip.count("EXAMPLE"):
+            test.cancel("The remote ip is Sample one, pls configure it first")
+        ssh_key.setup_ssh_key(remote_ip, remote_user, remote_pwd)
 
     # Instead of "paused_after_start_vm", use "pre_vm_state".
     # After start the VM, wait for some time to make sure the job
@@ -98,26 +107,36 @@ def run(test, params, env):
                     # of domain state change and focus on domcontrol command
                     # status while domain is running.
                     if vm.is_alive():
-                        raise error.TestFail("Run failed with right command")
+                        test.fail("Run failed with right command")
     else:
-        # Check domain contorl interface state without job on domain.
+        if remote_uri:
+            # check remote domain status
+            if not virsh.is_alive(vm_name, uri=remote_uri):
+                # If remote domain is not running, start remote domain
+                virsh.start(vm_name, uri=remote_uri)
+
+        # Check domain control interface state without job on domain.
         ret = virsh.domcontrol(vm_ref, options, readonly=readonly,
-                               ignore_status=True, debug=True)
+                               ignore_status=True, debug=True, uri=remote_uri)
         status = ret.exit_status
 
         # check status_error
         if status_error == "yes":
             if status == 0:
-                raise error.TestFail("Run successfully with wrong command!")
+                test.fail("Run successfully with wrong command!")
         elif status_error == "no":
             if status != 0:
-                raise error.TestFail("Run failed with right command")
+                test.fail("Run failed with right command")
 
     # Recover the environment.
     if action == "managedsave":
         virsh.managedsave_remove(vm_name, ignore_status=True)
     if os.path.exists(tmp_file):
         os.unlink(tmp_file)
+    if remote_uri:
+        if virsh.is_alive(vm_name, uri=remote_uri):
+            # Destroy remote domain
+            virsh.destroy(vm_name, uri=remote_uri)
     if pre_vm_state == "suspend":
         vm.resume()
     if process:

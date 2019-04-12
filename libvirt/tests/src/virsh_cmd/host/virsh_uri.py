@@ -42,7 +42,7 @@ def run(test, params, env):
         cmd = "virsh uri %s" % option
 
     # Prepare libvirtd service
-    check_libvirtd = "libvirtd" in params.keys()
+    check_libvirtd = "libvirtd" in list(params.keys())
     if check_libvirtd:
         libvirtd = params.get("libvirtd")
         if libvirtd == "off":
@@ -52,10 +52,8 @@ def run(test, params, env):
     logging.info("The command: %s", cmd)
 
     # setup autologin for ssh to remote machine to execute commands
-    config_opt = ["StrictHostKeyChecking=no"]
     if remote_ref:
-        ssh_key.setup_remote_ssh_key(remote_ip, remote_user, remote_pwd,
-                                     config_options=config_opt)
+        ssh_key.setup_ssh_key(remote_ip, remote_user, remote_pwd)
 
     try:
         if remote_ref == "remote":
@@ -81,7 +79,7 @@ def run(test, params, env):
         else:
             logging.info("command: %s is a expected error", cmd)
     elif status_error == "no":
-        if cmp(target_uri, uri_test) != 0:
+        if target_uri != uri_test:
             raise exceptions.TestFail("Virsh cmd uri %s != %s." %
                                       (uri_test, target_uri))
         if status != 0:

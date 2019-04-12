@@ -3,10 +3,13 @@ import os
 import ast
 import shutil
 import logging
+
+from six.moves import xrange
+
 from avocado.utils import process
-from autotest.client import utils
 from virttest import virt_vm, virsh
 from virttest import utils_package
+from virttest import utils_misc
 from virttest.utils_test import libvirt
 from virttest.libvirt_xml import vm_xml
 from virttest.libvirt_xml.devices import rng
@@ -113,10 +116,10 @@ def run(test, params, env):
         if backend_dev:
             cmd = "lsof |grep %s" % backend_dev
             ret = process.run(cmd, ignore_status=True, shell=True)
-            if ret.exit_status or not ret.stdout.count("qemu"):
+            if ret.exit_status or not ret.stdout_text.count("qemu"):
                 test.fail("Failed to check random device"
                           " on host, command output: %s" %
-                          ret.stdout)
+                          ret.stdout_text)
 
     def check_snapshot(bgjob=None):
         """
@@ -126,9 +129,9 @@ def run(test, params, env):
         snapshot_name2 = "snap.s2"
         if not snapshot_vm_running:
             vm.destroy(gracefully=False)
-        ret = virsh.snapshot_create_as(vm_name, snapshot_name1)
+        ret = virsh.snapshot_create_as(vm_name, snapshot_name1, debug=True)
         libvirt.check_exit_status(ret)
-        snap_lists = virsh.snapshot_list(vm_name)
+        snap_lists = virsh.snapshot_list(vm_name, debug=True)
         if snapshot_name not in snap_lists:
             test.fail("Snapshot %s doesn't exist"
                       % snapshot_name)
@@ -138,10 +141,10 @@ def run(test, params, env):
         else:
             options = ""
         ret = virsh.snapshot_revert(
-            vm_name, ("%s %s" % (snapshot_name, options)))
+            vm_name, ("%s %s" % (snapshot_name, options)), debug=True)
         libvirt.check_exit_status(ret)
-        ret = virsh.dumpxml(vm_name)
-        if ret.stdout.count("<rng model="):
+        ret = virsh.dumpxml(vm_name, debug=True)
+        if ret.stdout.strip().count("<rng model="):
             test.fail("Found rng device in xml")
 
         if snapshot_with_rng:
@@ -156,25 +159,25 @@ def run(test, params, env):
             # Add random server
             if params.get("backend_type") == "tcp":
                 cmd = "cat /dev/random | nc -4 -l localhost 1024"
-                bgjob = utils.AsyncJob(cmd)
+                bgjob = utils_misc.AsyncJob(cmd)
             vm.start()
             vm.wait_for_login().close()
         err_msgs = ("live disk snapshot not supported"
                     " with this QEMU binary")
         ret = virsh.snapshot_create_as(vm_name,
                                        "%s --disk-only"
-                                       % snapshot_name2)
+                                       % snapshot_name2, debug=True)
         if ret.exit_status:
             if ret.stderr.count(err_msgs):
                 test.skip(err_msgs)
             else:
                 test.fail("Failed to create external snapshot")
-        snap_lists = virsh.snapshot_list(vm_name)
+        snap_lists = virsh.snapshot_list(vm_name, debug=True)
         if snapshot_name2 not in snap_lists:
             test.fail("Failed to check snapshot list")
 
-        ret = virsh.domblklist(vm_name)
-        if not ret.stdout.count(snapshot_name2):
+        ret = virsh.domblklist(vm_name, debug=True)
+        if not ret.stdout.strip().count(snapshot_name2):
             test.fail("Failed to find snapshot disk")
 
     def check_guest(session):
@@ -200,7 +203,7 @@ def run(test, params, env):
             test.fail("Failed to read the random device")
         rng_rate = params.get("rng_rate")
         if rng_rate:
-            rate_bytes, rate_period = ast.literal_eval(rng_rate).values()
+            rate_bytes, rate_period = list(ast.literal_eval(rng_rate).values())
             rate_conf = float(rate_bytes) / (float(rate_period)/1000)
             ret = re.search(r"(\d+) bytes.*copied, (\d+.\d+) s",
                             output, re.M)
@@ -241,6 +244,7 @@ def run(test, params, env):
                   "supported on this libvirt version")
     # Back up xml file.
     vmxml_backup = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name)
+    logging.debug("vm xml is %s", vmxml_backup)
 
     # Try to install rng-tools on host, it can speed up random rate
     # if installation failed, ignore the error and continue the test
@@ -265,12 +269,19 @@ def run(test, params, env):
     # Build the xml and run test.
     try:
         bgjob = None
+
+        # Prepare xml, make sure no extra rng dev.
+        vmxml = vmxml_backup.copy()
+        vmxml.remove_all_device_by_type('rng')
+        vmxml.sync()
+        logging.debug("Prepared vm xml without rng dev is %s", vmxml)
+
         # Take snapshot if needed
         if snapshot_name:
             if snapshot_vm_running:
                 vm.start()
                 vm.wait_for_login().close()
-            ret = virsh.snapshot_create_as(vm_name, snapshot_name)
+            ret = virsh.snapshot_create_as(vm_name, snapshot_name, debug=True)
             libvirt.check_exit_status(ret)
 
         # Destroy VM first
@@ -305,7 +316,7 @@ def run(test, params, env):
             # Add random server
             if params.get("backend_type") == "tcp":
                 cmd = "cat /dev/random | nc -4 -l localhost 1024"
-                bgjob = utils.AsyncJob(cmd)
+                bgjob = utils_misc.AsyncJob(cmd)
 
             # Start the VM.
             vm.start()
@@ -334,14 +345,13 @@ def run(test, params, env):
                           'please refer to https://bugzilla.'
                           'redhat.com/show_bug.cgi?id=1220252:'
                           '\n%s' % details)
-
     finally:
         # Delete snapshots.
-        snapshot_lists = virsh.snapshot_list(vm_name)
+        snapshot_lists = virsh.snapshot_list(vm_name, debug=True)
         if len(snapshot_lists) > 0:
             libvirt.clean_up_snapshots(vm_name, snapshot_lists)
             for snapshot in snapshot_lists:
-                virsh.snapshot_delete(vm_name, snapshot, "--metadata")
+                virsh.snapshot_delete(vm_name, snapshot, "--metadata", debug=True)
 
         # Recover VM.
         if vm.is_alive():

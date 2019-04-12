@@ -5,10 +5,11 @@ import time
 import platform
 import threading
 
+from six import itervalues, string_types
 from avocado.utils import process
 from avocado.utils import path
+from avocado.core import exceptions
 
-from virttest import nfs
 from virttest import remote
 from virttest import defaults
 from virttest import utils_test
@@ -19,14 +20,13 @@ from virttest import libvirt_vm
 from virttest import utils_package
 from virttest.libvirt_xml import vm_xml
 from virttest.libvirt_xml.devices import memory
-from virttest.libvirt_xml.xcepts import LibvirtXMLNotFoundError
 from virttest import utils_misc
-from virttest.utils_misc import SELinuxBoolean
 from virttest.qemu_storage import QemuImg
 from virttest.utils_test import libvirt
 from virttest import test_setup
-from virttest import ssh_key
 from virttest.staging import utils_memory
+from virttest.compat_52lts import decode_to_text as to_text
+from virttest.libvirt_xml.xcepts import LibvirtXMLNotFoundError
 
 from provider import libvirt_version
 
@@ -35,6 +35,9 @@ def run(test, params, env):
     """
     Test virsh migrate command.
     """
+
+    readonly = (params.get("migrate_readonly", "no") == "yes")
+    virsh_args = {"ignore_status": True, "debug": True, "readonly": readonly}
 
     def check_vm_state(vm, state, uri=None, ignore_error=True):
         """
@@ -55,7 +58,7 @@ def run(test, params, env):
             actual_state = virsh.domstate(vm.name, uri=uri).stdout.strip()
         else:
             actual_state = vm.state()
-        if cmp(actual_state, state) != 0:
+        if actual_state != state:
             if not ignore_error:
                 test.fail("The VM state is expected '%s' "
                           "but '%s' found" % (state, actual_state))
@@ -83,7 +86,7 @@ def run(test, params, env):
                 if vm.is_persistent():
                     vm.undefine()
 
-        except Exception, detail:
+        except Exception as detail:
             logging.error("Cleaning up destination failed.\n%s", detail)
 
         if src_uri:
@@ -98,15 +101,19 @@ def run(test, params, env):
         :raise: test.cancel when some known messages found
         """
         logging.debug("Migration result:\n%s", migration_res)
-        if migration_res.stderr.find("error: unsupported configuration:") >= 0:
+        if (migration_res.stderr.find("error: unsupported configuration:") >= 0 and
+                not params.get("unsupported_conf", "no") == "yes"):
             test.cancel(migration_res.stderr)
 
-    def do_migration(delay, vm, dest_uri, options, extra):
+    def do_migration(delay, vm, dest_uri, options, extra, **virsh_args):
         logging.info("Sleeping %d seconds before migration", delay)
         time.sleep(delay)
         # Migrate the guest.
-        migration_res = vm.migrate(dest_uri, options, extra, True, True)
+        migration_res = vm.migrate(dest_uri, options, extra, **virsh_args)
         logging.info("Migration exit status: %d", migration_res.exit_status)
+        logging.info("Migration command: %s", migration_res.command)
+        logging.info("Migration stdout: %s", migration_res.stdout)
+        logging.info("Migration stderr: %s", migration_res.stderr)
         check_migration_result(migration_res)
         if int(migration_res.exit_status) != 0:
             logging.error("Migration failed for %s.", vm_name)
@@ -123,7 +130,9 @@ def run(test, params, env):
                 return False
 
         # Throws exception if console shows panic message
-        vm.verify_kernel_crash()
+        if not options.count("dname") and not extra.count("dname"):
+            vm.verify_kernel_crash()
+
         return True
 
     def numa_pin(memory_mode, memnode_mode, numa_dict_list, host_numa_node):
@@ -192,7 +201,7 @@ def run(test, params, env):
         else:
             for index in range(2):
                 numa_dict['id'] = str(index)
-                numa_dict['memory'] = str(max_mem / 2)
+                numa_dict['memory'] = str(max_mem // 2)
                 numa_dict['unit'] = str(max_mem_unit)
                 if vcpu == 2:
                     numa_dict['cpus'] = "%s" % str(index)
@@ -202,9 +211,9 @@ def run(test, params, env):
                             numa_dict['cpus'] = "%s" % str(index)
                         if vcpu > 3:
                             numa_dict['cpus'] = "%s-%s" % (str(index),
-                                                           str(vcpu / 2 - 1))
+                                                           str(vcpu // 2 - 1))
                     else:
-                        numa_dict['cpus'] = "%s-%s" % (str(vcpu / 2),
+                        numa_dict['cpus'] = "%s-%s" % (str(vcpu // 2),
                                                        str(vcpu - 1))
                 numa_dict_list.append(numa_dict)
                 numa_dict = {}
@@ -317,7 +326,7 @@ def run(test, params, env):
                 if (cmd_output[0] != 0):
                     test.cancel("HP not supported/configured")
             else:
-                process.system_output(command, verbose=True, shell=True)
+                to_text(process.system_output(command, verbose=True, shell=True))
 
     def create_mem_hotplug_xml(mem_size, mem_unit, numa_node='',
                                mem_model='dimm'):
@@ -341,34 +350,26 @@ def run(test, params, env):
         logging.debug(mem_xml)
         mem_xml_file = os.path.join(data_dir.get_tmp_dir(),
                                     'memory_hotplug.xml')
-        try:
-            fp = open(mem_xml_file, 'w')
-        except Exception, info:
-            test.error(info)
-        fp.write(str(mem_xml))
-        fp.close()
+        with open(mem_xml_file, 'w') as fp:
+            fp.write(str(mem_xml))
+
         return mem_xml_file
 
-    def cpu_hotplug_hotunplug(vm, vm_addr, cpu_count, operation,
-                              uri=None, params=None):
+    def cpu_hotplug_hotunplug(vm, cpu_count, operation, uri=None):
         """
         Performs CPU Hotplug or Hotunplug based on the cpu_count given.
 
         :param vm: VM object
-        :param vm_addr: IP address of VM
         :param cpu_count: No of CPUs to be hotplugged or hotunplugged
         :param operation: operation to be performed, ie hotplug or hotunplug
         :param uri: virsh connect uri if operation to be performed remotely
-        :param params: Test dict params
 
         :raise test.fail if hotplug or hotunplug doesn't work
         """
-        if params:
-            remote_user = params.get("remote_user", "root")
-            remote_ip = params.get("remote_ip", "REMOTE.EXAMPLE.COM")
-            remote_pwd = params.get("remote_pwd", None)
-            session = remote.remote_login("ssh", remote_ip, "22", remote_user,
-                                          remote_pwd, r"[\#\$]\s*$")
+        if uri:
+            connect_uri = vm.connect_uri
+            vm.connect_uri = uri
+            session = vm.wait_for_serial_login()
         else:
             session = vm.wait_for_login()
         status = virsh.setvcpus(vm.name, cpu_count, extra="--live", debug=True,
@@ -393,34 +394,17 @@ def run(test, params, env):
 
             logging.debug("Checking CPU number gets reflected from inside "
                           "guest")
-            cmd = "lscpu | grep \"^CPU(s):\""
-            if params:
-                guest_user = params.get("username", "root")
-                ssh_cmd = "ssh %s@%s" % (guest_user, vm_addr)
-                ssh_cmd += " -o StrictHostKeyChecking=no"
-                cmd = "%s '%s'" % (ssh_cmd, cmd)
-            # vcpu count gets reflected step by step gradually, so we check
-            # vcpu and compare with previous count by taking 5 seconds, if
-            # there is no change in vpcu count we break the loop.
-            prev_output = -1
-            while True:
-                ret, output = session.cmd_status_output(cmd)
-                if ret:
-                    test.fail("CPU %s failed - %s" % (operation, output))
-                output = output.split(":")[-1].strip()
+            if not utils_misc.wait_for(lambda: utils_misc.check_if_vm_vcpu_match(cpu_count, vm),
+                                       300, text="wait for vcpu online"):
+                test.fail("CPU %s failed" % operation)
 
-                if int(prev_output) == int(output):
-                    break
-                prev_output = output
-                time.sleep(5)
-            logging.debug("CPUs available from inside guest after %s - %s",
-                          operation, output)
-            if int(output) != cpu_count:
-                test.fail("CPU %s failed as cpus are not "
-                          "reflected from inside guest" % operation)
             logging.debug("CPU %s successful !!!", operation)
-        except Exception, info:
+        except Exception as info:
             test.fail("CPU %s failed - %s" % (operation, info))
+        finally:
+            # recover the connect uri
+            if uri:
+                vm.connect_uri = connect_uri
 
     def check_migration_timeout_suspend(timeout):
         """
@@ -453,7 +437,7 @@ def run(test, params, env):
                                                 "--timeout 20s")
         try:
             vm_session.cmd('stress %s' % stress_args)
-        except Exception, detail:
+        except Exception as detail:
             logging.debug(detail)
 
     def ensure_migration_start():
@@ -465,7 +449,7 @@ def run(test, params, env):
         count = 0
         while (count < migrate_start_timeout):
             if (virsh.domain_exists(vm.name, uri=dest_uri) and
-               check_vm_state(vm, 'paused', dest_uri, True)):
+                    check_vm_state(vm, 'paused', dest_uri, True)):
                 logging.debug("Domain exists with 'paused' state "
                               "with '%s' after %d seconds", dest_uri, count)
                 break
@@ -475,16 +459,17 @@ def run(test, params, env):
                 count += 1
                 time.sleep(1)
         if (count == migrate_start_timeout and
-           not virsh.domain_exists(vm.name, uri=dest_uri)):
+                not virsh.domain_exists(vm.name, uri=dest_uri)):
             test.error("Domain is not found with 'paused' state in 50s")
 
-    def run_migration_cmd(cmd):
+    def run_migration_cmd(cmd, timeout=60):
         """
         Check to see the VM on target machine should ran up once
         migration-postcopy command is executed. To get sufficient time to
         check this command takes effect, the VM need run with stress.
 
         :params cmd: The command to be executed while migration
+        :params timeout: timeout for migrate-postcopy to get triggered
 
         """
         stress_thread = threading.Thread(target=thread_func_stress,
@@ -494,14 +479,21 @@ def run(test, params, env):
         process.system_output("virsh %s %s" % (cmd, vm_name))
         logging.debug("Checking the VM state on target host after "
                       "executing '%s'", cmd)
-        check_vm_state(vm, 'running', dest_uri, False)
+
+        def check_vm_state_dest():
+            return check_vm_state(vm, 'running', dest_uri, ignore_error=True)
+
+        # check_vm_state can fail if it checks immediately after virsh
+        # migrate-postcopy, just give a breathe time.
+        if not utils_misc.wait_for(check_vm_state_dest, timeout=timeout):
+            test.fail("VM failed to be in running state at destination")
 
     # For negative scenarios, there_desturi_nonexist and there_desturi_missing
     # let the test takes desturi from variants in cfg and for other scenarios
     # let us use API to form complete uri
     extra = params.get("virsh_migrate_extra")
     migrate_dest_ip = params.get("migrate_dest_host")
-    if "virsh_migrate_desturi" not in params.keys():
+    if "virsh_migrate_desturi" not in list(params.keys()):
         params["virsh_migrate_desturi"] = libvirt_vm.complete_uri(migrate_dest_ip)
 
     migrate_uri = params.get("virsh_migrate_migrateuri", None)
@@ -539,8 +531,8 @@ def run(test, params, env):
             params["migrate_shared_storage"] = shared_storage = os.path.join(nfs_mount_path,
                                                                              (default_guest_asset))
 
-    for v in params.itervalues():
-        if isinstance(v, str) and v.count("EXAMPLE"):
+    for v in list(itervalues(params)):
+        if isinstance(v, string_types) and v.count("EXAMPLE"):
             test.cancel("Please set real value for %s" % v)
 
     options = params.get("virsh_migrate_options")
@@ -589,21 +581,6 @@ def run(test, params, env):
     params["disk_type"] = "file"
     params["disk_source_protocol"] = "netfs"
     params["mnt_path_name"] = nfs_mount_path
-
-    # Params for NFS and SSH setup
-    params["server_ip"] = migrate_dest_ip
-    params["server_user"] = "root"
-    params["server_pwd"] = params.get("migrate_dest_pwd")
-    params["client_ip"] = params.get("migrate_source_host")
-    params["client_user"] = "root"
-    params["client_pwd"] = params.get("migrate_source_pwd")
-    params["nfs_client_ip"] = migrate_dest_ip
-    params["nfs_server_ip"] = params.get("migrate_source_host")
-
-    # Params to enable SELinux boolean on remote host
-    params["remote_boolean_varible"] = "virt_use_nfs"
-    params["remote_boolean_value"] = "on"
-    params["set_sebool_remote"] = "yes"
 
     server_ip = params.get("server_ip")
     server_user = params.get("server_user", "root")
@@ -659,7 +636,31 @@ def run(test, params, env):
                                                 "no")
     hotunplug_after_migrate = "yes" == params.get("virsh_hotunplug_cpu_after",
                                                   "no")
+    compat_guest_migrate = (params.get("host_arch", "all_arch") in
+                            utils_misc.get_cpu_info()['Model name'])
+    compat_mode = "yes" == params.get("compat_mode", "no")
 
+    # Configurations for cpu compat guest to boot
+    if compat_mode:
+        if compat_guest_migrate:
+            if not libvirt_version.version_compare(3, 2, 0):
+                test.cancel("host CPU model is not supported")
+            if vm.is_alive():
+                vm.destroy()
+            cpu_model = params.get("cpu_model", None)
+            vm_xml.VMXML.set_cpu_mode(vm.name, mode='host-model',
+                                      model=cpu_model)
+            vm.start()
+            session = vm.wait_for_login()
+            actual_cpu_model = utils_misc.get_cpu_info(session)['Model name']
+            if cpu_model not in actual_cpu_model.lower():
+                test.error("Failed to configure cpu model,\nexpected: %s but "
+                           "actual cpu model: %s" % (cpu_model,
+                                                     actual_cpu_model))
+            logging.debug("Configured cpu model successfully! Guest booted "
+                          "with CPU model: %s", actual_cpu_model)
+        else:
+            test.cancel("Host arch is not POWER9")
     # Configurations for cpu hotplug and cpu hotunplug
     if cpu_hotplug:
         # To check cpu hotplug is supported or not
@@ -730,13 +731,13 @@ def run(test, params, env):
             default_hp_unit = "KiB"
             hp_pin_nodes = int(params.get("HP_pin_node_count", "2"))
             vm_max_mem = vmxml.max_mem
-            no_of_HPs = int(vm_max_mem / host_hp_size) + 1
+            no_of_HPs = int(vm_max_mem // host_hp_size) + 1
             # setting hugepages in source machine
             if (int(utils_memory.get_num_huge_pages_free()) < no_of_HPs):
                 hugepage_assign(str(no_of_HPs))
             logging.debug("Hugepage support check done on host")
-        except:
-            test.cancel("HP not supported/configured")
+        except Exception as info:
+            test.cancel("HP not supported/configured: %s" % info)
 
     # To check mem hotplug should not exceed maxmem
     if mem_hotplug:
@@ -788,13 +789,14 @@ def run(test, params, env):
     disk_cache = params.get("virsh_migrate_disk_cache", "none")
     params["driver_cache"] = disk_cache
     unsafe_test = False
-    if options.count("unsafe") and disk_cache != "none":
+    if options.count("unsafe") and disk_cache not in ["none", "directsync"]:
         unsafe_test = True
 
     migrate_setup = None
     nfs_client = None
     seLinuxBool = None
     skip_exception = False
+    fail_exception = False
     exception = False
     remote_viewer_pid = None
     asynch_migration = False
@@ -809,22 +811,8 @@ def run(test, params, env):
     try:
         # Change the disk of the vm to shared disk
         libvirt.set_vm_disk(vm, params)
-        # Backup the SELinux status on local host for recovering
-        local_selinux_bak = params.get("selinux_status_bak")
 
-        # Configure NFS client on remote host
-        nfs_client = nfs.NFSClient(params)
-        nfs_client.setup()
-
-        logging.info("Enable virt NFS SELinux boolean on target host.")
-        seLinuxBool = SELinuxBoolean(params)
-        seLinuxBool.setup()
-
-        # Permit iptables to permit 49152-49216 ports to libvirt for
-        # migration and if arch is ppc with power8 then switch off smt
-        # will be taken care in remote machine for migration to succeed
         migrate_setup = libvirt.MigrationTest()
-        migrate_setup.migrate_pre_setup(dest_uri, params)
 
         subdriver = utils_test.get_image_info(shared_storage)['format']
         extra_attach = ("--config --driver qemu --subdriver %s --cache %s"
@@ -925,27 +913,13 @@ def run(test, params, env):
 
         # Perform cpu hotplug or hotunplug before migration
         if cpu_hotplug:
-            if hotplug_after_migrate or hotunplug_after_migrate:
-                config_opt = ["StrictHostKeyChecking=no"]
-                guest_user = params.get("username", "root")
-                guest_ip = vm.get_address()
-                guest_pwd = params.get("password", "password")
-                # Configure ssh key between destination machine and VM
-                # before migration, so that commands can be executed from
-                # destination machine to VM after migration for validation
-                ssh_key.setup_remote_ssh_key(server_ip, server_user,
-                                             server_pwd, hostname2=guest_ip,
-                                             user2=guest_user,
-                                             password2=guest_pwd,
-                                             config_options=config_opt,
-                                             public_key="rsa")
             if hotplug_before_migrate:
                 logging.debug("Performing CPU Hotplug before migration")
-                cpu_hotplug_hotunplug(vm, guest_ip, max_vcpus, "Hotplug")
+                cpu_hotplug_hotunplug(vm, max_vcpus, "Hotplug")
             if cpu_hotunplug:
                 if hotunplug_before_migrate:
                     logging.debug("Performing CPU Hot Unplug before migration")
-                    cpu_hotplug_hotunplug(vm, guest_ip, current_vcpus, "Hotunplug")
+                    cpu_hotplug_hotunplug(vm, current_vcpus, "Hotunplug")
 
         # Perform memory hotplug after VM is up
         if mem_hotplug:
@@ -1037,6 +1011,10 @@ def run(test, params, env):
                     vmxml.vm_name = vm_new_name
                 extra = ("%s --xml=%s" % (extra, vmxml.xml))
 
+        # Get VM uptime before migration
+        vm_uptime = vm.uptime()
+        logging.info("Check VM uptime before migration: %s", vm_uptime)
+
         # Turn VM into certain state.
         logging.debug("Turning %s into certain state.", vm.name)
         if src_state == "paused":
@@ -1117,7 +1095,7 @@ def run(test, params, env):
                                            func=run_migration_cmd,
                                            func_params=cmd,
                                            shell=True)
-            except Exception, info:
+            except Exception as info:
                 test.fail(info)
             if obj_migration.RET_MIGRATION:
                 utils_test.check_dest_vm_network(vm, vm.get_address(),
@@ -1128,10 +1106,19 @@ def run(test, params, env):
             else:
                 ret_migrate = False
         if not asynch_migration:
-            ret_migrate = do_migration(delay, vm, dest_uri, options, extra)
+            ret_migrate = do_migration(delay, vm, dest_uri, options, extra, **virsh_args)
 
         dest_state = params.get("virsh_migrate_dest_state", "running")
         if ret_migrate and dest_state == "running":
+            if (not options.count("dname") and not extra.count("dname")):
+                # Check VM uptime after migrating to destination
+                migrated_vm_uptime = vm.uptime(dest_uri)
+                logging.info("Check VM uptime in destination after "
+                             "migration: %s", migrated_vm_uptime)
+                if vm_uptime > migrated_vm_uptime:
+                    test.fail("VM went for a reboot while migrating "
+                              "to destination")
+
             server_session = remote.wait_for_login('ssh', server_ip, '22',
                                                    server_user, server_pwd,
                                                    r"[\#\$]\s*$")
@@ -1143,8 +1130,8 @@ def run(test, params, env):
             logging.info(o_ping)
             if s_ping != 0:
                 server_session.close()
-                test.error("%s did not respond after %d sec." % (vm.name,
-                                                                 ping_timeout))
+                test.fail("%s did not respond after %d sec." % (vm.name,
+                                                                ping_timeout))
             server_session.close()
             logging.debug("Migration from %s to %s success" %
                           (src_uri, dest_uri))
@@ -1166,7 +1153,7 @@ def run(test, params, env):
                                                     ignore_status=True,
                                                     func=func,
                                                     func_params=params)
-                    except Exception, info:
+                    except Exception as info:
                         test.fail(info)
                     ret_migrate = migration_test.RET_MIGRATION
                 elif postcopy_cmd != "":
@@ -1178,17 +1165,25 @@ def run(test, params, env):
                                                    func=process.run,
                                                    func_params=cmd,
                                                    shell=True)
-                    except Exception, info:
+                    except Exception as info:
                         test.fail(info)
                     ret_migrate = obj_migration.RET_MIGRATION
+
+                # Check for VM uptime migrating back
+                vm_uptime = vm.uptime()
+                logging.info("Check VM uptime after migrating back to source: %s",
+                             vm_uptime)
+                if migrated_vm_uptime > vm_uptime:
+                    test.fail("VM went for a reboot while migrating back to source")
+
                 logging.info("To check VM network connectivity after "
                              "migrating back to source")
                 s_ping, o_ping = utils_test.ping(vm_ip, count=ping_count,
                                                  timeout=ping_timeout)
                 logging.info(o_ping)
                 if s_ping != 0:
-                    test.error("%s did not respond after %d sec." %
-                               (vm.name, ping_timeout))
+                    test.fail("%s did not respond after %d sec." %
+                              (vm.name, ping_timeout))
                 # clean up of pre migration setup for local machine
                 migrate_setup.migrate_pre_setup(src_uri, params,
                                                 cleanup=True)
@@ -1200,16 +1195,15 @@ def run(test, params, env):
                                                 server_user, server_pwd,
                                                 r"[\#\$]\s*$")
                 if migrate_there_and_back:
-                    uri = src_uri
+                    uri = None
                 if hotplug_after_migrate:
                     logging.debug("Performing CPU Hotplug after migration")
-                    cpu_hotplug_hotunplug(vm, vm_ip, max_vcpus, "Hotplug",
-                                          uri=uri, params=params)
+                    cpu_hotplug_hotunplug(vm, max_vcpus, "Hotplug", uri=uri)
                 if cpu_hotunplug:
                     if hotunplug_after_migrate:
                         logging.debug("Performing CPU Hot Unplug after migration")
-                        cpu_hotplug_hotunplug(vm, vm_ip, current_vcpus,
-                                              "Hotunplug", uri=uri, params=params)
+                        cpu_hotplug_hotunplug(vm, current_vcpus, "Hotunplug",
+                                              uri=uri)
 
         if graphics_server:
             logging.info("To check the process running '%s'.",
@@ -1297,9 +1291,11 @@ def run(test, params, env):
             if not re.search(new_nic_mac, vm_dest_xml):
                 check_dest_xml = False
 
-    except test.cancel, detail:
+    except exceptions.TestCancel as detail:
         skip_exception = True
-    except Exception, detail:
+    except exceptions.TestFail as detail:
+        fail_exception = True
+    except Exception as detail:
         exception = True
         logging.error("%s: %s", detail.__class__, detail)
 
@@ -1340,33 +1336,14 @@ def run(test, params, env):
     if attach_scsi_disk:
         libvirt.delete_local_disk("file", path=scsi_disk)
 
-    if seLinuxBool:
-        logging.info("Recover virt NFS SELinux boolean on target host...")
-        # keep .ssh/authorized_keys for NFS cleanup later
-        seLinuxBool.cleanup(True)
-
-    if nfs_client:
-        logging.info("Cleanup NFS client environment...")
-        nfs_client.cleanup()
-
     logging.info("Remove the NFS image...")
     source_file = params.get("source_file")
     libvirt.delete_local_disk("file", path=source_file)
 
-    logging.info("Cleanup NFS server environment...")
-    exp_dir = params.get("export_dir")
-    mount_dir = params.get("mnt_path_name")
-    libvirt.setup_or_cleanup_nfs(False, export_dir=exp_dir,
-                                 mount_dir=mount_dir,
-                                 restore_selinux=local_selinux_bak,
-                                 rm_export_dir=False)
-    # cleanup pre migration setup for remote machine
-    if migrate_setup:
-        logging.debug("Clean up migration setup for remote machine")
-        migrate_setup.migrate_pre_setup(dest_uri, params, cleanup=True)
-
     if skip_exception:
         test.cancel(detail)
+    if fail_exception:
+        test.fail(detail)
     if exception:
         test.error("Error occurred. \n%s: %s" % (detail.__class__, detail))
 

@@ -2,12 +2,12 @@ import os
 import subprocess
 import logging
 import time
-
-from autotest.client.shared import error
-from autotest.client.shared import ssh_key
+import locale
 
 from virttest import virsh
+from virttest import data_dir
 from virttest.utils_test import libvirt as utlv
+from virttest import ssh_key
 
 
 def run(test, params, env):
@@ -26,6 +26,7 @@ def run(test, params, env):
     vm = env.get_vm(vm_name)
     start_vm = params.get("start_vm")
     pre_vm_state = params.get("pre_vm_state", "start")
+    readonly = ("yes" == params.get("readonly", "no"))
     if start_vm == "no" and vm.is_alive():
         vm.destroy()
 
@@ -64,16 +65,21 @@ def run(test, params, env):
         return p
 
     action = params.get("jobabort_action", "dump")
+    dump_opt = params.get("dump_opt", None)
     status_error = params.get("status_error", "no")
     job = params.get("jobabort_job", "yes")
-    tmp_file = os.path.join(test.tmpdir, "domjobabort.tmp")
-    tmp_pipe = os.path.join(test.tmpdir, "domjobabort.fifo")
+    tmp_file = os.path.join(data_dir.get_tmp_dir(), "domjobabort.tmp")
+    tmp_pipe = os.path.join(data_dir.get_tmp_dir(), "domjobabort.fifo")
     vm_ref = params.get("jobabort_vm_ref")
     remote_uri = params.get("jobabort_remote_uri")
     remote_host = params.get("migrate_dest_host")
     remote_user = params.get("migrate_dest_user", "root")
     remote_pwd = params.get("migrate_dest_pwd")
     saved_data = None
+
+    # Build job action
+    if dump_opt:
+        action = "dump --crash"
 
     if action == "managedsave":
         tmp_pipe = '/var/lib/libvirt/qemu/save/%s.save' % vm.name
@@ -83,8 +89,8 @@ def run(test, params, env):
 
     if action == "migrate":
         if remote_host.count("EXAMPLE"):
-            raise error.TestNAError("Remote host should be configured "
-                                    "for migrate.")
+            test.cancel("Remote host should be configured "
+                        "for migrate.")
         else:
             # Config ssh autologin for remote host
             ssh_key.setup_ssh_key(remote_host, remote_user,
@@ -114,14 +120,15 @@ def run(test, params, env):
 
         saved_data = None
         if action == "restore":
-            saved_data = file(tmp_file, 'r').read(10 * 1024 * 1024)
+            with open(tmp_file, 'r') as tmp_f:
+                saved_data = tmp_f.read(10 * 1024 * 1024)
             f = open(tmp_pipe, 'w')
             f.write(saved_data[:1024 * 1024])
         elif action == "migrate":
             f = None
         else:
-            f = open(tmp_pipe, 'r')
-            dummy = f.read(1024 * 1024)
+            f = open(tmp_pipe, 'rb')
+            dummy = f.read(1024 * 1024).decode(locale.getpreferredencoding(), 'ignore')
 
     # Give enough time for starting job
     t = 0
@@ -137,7 +144,10 @@ def run(test, params, env):
         else:
             logging.debug("Job started: %s", jobtype)
             break
-    ret = virsh.domjobabort(vm_ref, ignore_status=True, debug=True)
+    virsh_dargs = {'ignore_status': True, 'debug': True}
+    if readonly:
+        virsh_dargs.update({'readonly': True})
+    ret = virsh.domjobabort(vm_ref, **virsh_dargs)
     status = ret.exit_status
 
     if process and f:
@@ -174,7 +184,7 @@ def run(test, params, env):
     # check status_error
     if status_error == "yes":
         if status == 0:
-            raise error.TestFail("Run successfully with wrong command!")
+            test.fail("Run successfully with wrong command!")
     elif status_error == "no":
         if status != 0:
-            raise error.TestFail("Run failed with right command")
+            test.fail("Run failed with right command")

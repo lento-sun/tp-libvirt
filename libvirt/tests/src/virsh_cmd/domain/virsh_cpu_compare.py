@@ -6,6 +6,7 @@ from virttest import virsh
 from virttest.libvirt_xml import vm_xml
 from virttest.libvirt_xml import capability_xml
 from virttest.libvirt_xml.xcepts import LibvirtXMLNotFoundError
+from virttest import data_dir
 
 
 def run(test, params, env):
@@ -80,7 +81,7 @@ def run(test, params, env):
     modify_invalid = "yes" == params.get("cpu_compare_modify_invalid", "no")
     check_vm_ps = "yes" == params.get("check_vm_ps", "no")
     check_vm_ps_value = params.get("check_vm_ps_value")
-    tmp_file = os.path.join(test.tmpdir, file_name)
+    tmp_file = os.path.join(data_dir.get_tmp_dir(), file_name)
 
     vm_name = params.get("main_vm")
     vm = env.get_vm(vm_name)
@@ -113,58 +114,57 @@ def run(test, params, env):
 
         # Prepare temp compare file.
         cpu_compare_xml = get_cpu_xml(target, mode)
-        cpu_compare_xml_f = open(tmp_file, 'w+b')
-        if mode == "clear":
-            cpu_compare_xml_f.truncate(0)
-        else:
-            cpu_compare_xml.xmltreefile.write(cpu_compare_xml_f)
-        cpu_compare_xml_f.seek(0)
-        logging.debug("CPU description XML:\n%s", cpu_compare_xml_f.read())
-        cpu_compare_xml_f.close()
+        with open(tmp_file, 'w+') as cpu_compare_xml_f:
+            if mode == "clear":
+                cpu_compare_xml_f.truncate(0)
+            else:
+                cpu_compare_xml.xmltreefile.write(cpu_compare_xml_f)
+            cpu_compare_xml_f.seek(0)
+            logging.debug("CPU description XML:\n%s", cpu_compare_xml_f.read())
 
         # Expected possible result msg patterns and exit status
-        msg_patterns = ""
+        msg_patterns = []
         if not mode:
             if target == "host":
-                msg_patterns = "identical"
+                msg_patterns = ["identical"]
             else:
                 # As we don't know the <cpu> element in domain,
                 # so just check command exit status
                 pass
         elif mode == "delete":
             if cpu_match == "strict":
-                msg_patterns = "incompatible"
+                msg_patterns = ["incompatible"]
             else:
-                msg_patterns = "superset"
+                msg_patterns = ["superset"]
         elif mode == "modify":
             if modify_target == "mode":
                 if modify_invalid:
-                    msg_patterns = "Invalid mode"
+                    msg_patterns = ["Invalid mode"]
             elif modify_target == "model":
                 if modify_invalid:
-                    msg_patterns = "Unknown CPU model"
+                    msg_patterns = ["Unknown CPU model"]
             elif modify_target == "vendor":
                 if modify_invalid:
-                    msg_patterns = "incompatible"
+                    msg_patterns = ["incompatible"]
             elif modify_target == "feature_name":
                 if modify_value == "REPEAT":
-                    msg_patterns = "more than once"
+                    msg_patterns = ["more than once"]
                 elif modify_value == "ia64":
-                    msg_patterns = "incompatible"
+                    msg_patterns = ["incompatible"]
                 elif modify_invalid:
-                    msg_patterns = "Unknown"
+                    msg_patterns = ["Unknown"]
             elif modify_target == "feature_policy":
                 if modify_value == "forbid":
-                    msg_patterns = "incompatible"
+                    msg_patterns = ["incompatible"]
                 else:
-                    msg_patterns = "identical"
+                    msg_patterns = ["identical"]
             else:
                 test.cancel("Unsupport modify target %s in this "
                             "test" % mode)
         elif mode == "clear":
-            msg_patterns = "empty"
+            msg_patterns = ["empty", "does not contain any"]
         elif mode == "invalid_test":
-            msg_patterns = ""
+            msg_patterns = []
         else:
             test.cancel("Unsupport modify mode %s in this "
                         "test" % mode)
@@ -176,7 +176,7 @@ def run(test, params, env):
         else:
             # If exit status is not specified in cfg, using msg_patterns
             # to get expect exit status
-            if msg_patterns in ['identical', 'superset']:
+            if [item for item in msg_patterns if item in ['identical', 'superset']]:
                 expected_status = 0
             else:
                 expected_status = 1
@@ -204,7 +204,8 @@ def run(test, params, env):
                 output = result.stdout.strip()
             else:
                 output = result.stderr.strip()
-            if not output.count(msg_patterns):
+
+            if not [item for item in msg_patterns if output.count(item)]:
                 test.fail("Not find expect key word in command output")
 
         # Check VM for cpu 'mode' related cases

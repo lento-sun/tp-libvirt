@@ -7,6 +7,10 @@ import time
 from avocado.utils import process
 
 from virttest import remote
+<<<<<<< HEAD
+=======
+from virttest import data_dir
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
 from virttest import virt_vm
 from virttest import virsh
 from virttest import utils_package
@@ -14,6 +18,11 @@ from virttest.utils_test import libvirt
 from virttest.libvirt_xml import vm_xml
 from virttest.libvirt_xml.devices.disk import Disk
 
+<<<<<<< HEAD
+=======
+from provider import libvirt_version
+
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
 
 def run(test, params, env):
     """
@@ -35,6 +44,10 @@ def run(test, params, env):
     def encrypt_dev(device, params):
         """
         Encrypt device with luks format
+<<<<<<< HEAD
+=======
+
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
         :param device: Storage deivce to be encrypted.
         :param params: From the dict to get encryption password.
         """
@@ -49,12 +62,27 @@ def run(test, params, env):
     def check_dev_format(device, fmt="luks"):
         """
         Check if device is in luks format
+<<<<<<< HEAD
+=======
+
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
         :param device: Storage deivce to be checked.
         :param fmt: Expected disk format.
         :return: If device's format equals to fmt, return True, else return False.
         """
+<<<<<<< HEAD
         cmd = ("qemu-img info %s| grep -i 'file format' "
                "| grep -i %s" % (device, fmt))
+=======
+        cmd_result = process.run("qemu-img" + ' -h', ignore_status=True,
+                                 shell=True, verbose=False)
+        if b'-U' in cmd_result.stdout:
+            cmd = ("qemu-img info -U %s| grep -i 'file format' "
+                   "| grep -i %s" % (device, fmt))
+        else:
+            cmd = ("qemu-img info %s| grep -i 'file format' "
+                   "| grep -i %s" % (device, fmt))
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
         cmd_result = process.run(cmd, ignore_status=True, shell=True)
         if cmd_result.exit_status:
             test.fail("device %s is not in %s format. err is: %s" %
@@ -63,6 +91,10 @@ def run(test, params, env):
     def check_in_vm(target, old_parts):
         """
         Check mount/read/write disk in VM.
+<<<<<<< HEAD
+=======
+
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
         :param target: Disk dev in VM.
         :param old_parts: Original disk partitions in VM.
         :return: True if check successfully.
@@ -86,9 +118,15 @@ def run(test, params, env):
             status, output = session.cmd_status_output(cmd)
             logging.debug("Disk operation in VM:\nexit code:\n%s\noutput:\n%s",
                           status, output)
+<<<<<<< HEAD
             return s == 0
 
         except (remote.LoginError, virt_vm.VMError, aexpect.ShellError), e:
+=======
+            return status == 0
+
+        except (remote.LoginError, virt_vm.VMError, aexpect.ShellError) as e:
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
             logging.error(str(e))
             return False
 
@@ -109,21 +147,45 @@ def run(test, params, env):
     # can set a wrong password to luks_secret_passwd for negative tests
     luks_encrypt_passwd = params.get("luks_encrypt_passwd", "password")
     luks_secret_passwd = params.get("luks_secret_passwd", "password")
+<<<<<<< HEAD
 
     # Backend storage auth info
     use_auth_uuid = "yes" == params.get("use_auth_uuid", "yes")
     use_auth_usage = "yes" == params.get("use_auth_usage")
+=======
+    # Backend storage auth info
+    use_auth_usage = "yes" == params.get("use_auth_usage")
+    if use_auth_usage:
+        use_auth_uuid = False
+    else:
+        use_auth_uuid = "yes" == params.get("use_auth_uuid", "yes")
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
     auth_sec_usage_type = params.get("auth_sec_usage_type", "iscsi")
     auth_sec_usage_target = params.get("auth_sec_usage_target", "libvirtiscsi")
 
     status_error = "yes" == params.get("status_error")
     check_partitions = "yes" == params.get("virt_disk_check_partitions", "yes")
     hotplug_disk = "yes" == params.get("hotplug_disk", "no")
+<<<<<<< HEAD
     auth_sec_uuid = ""
     luks_sec_uuid = ""
     disk_auth_dict = {}
     pvt = None
 
+=======
+    encryption_in_source = "yes" == params.get("encryption_in_source", "no")
+    auth_in_source = "yes" == params.get("auth_in_source", "no")
+    auth_sec_uuid = ""
+    luks_sec_uuid = ""
+    disk_auth_dict = {}
+    disk_encryption_dict = {}
+    pvt = None
+
+    if ((encryption_in_source or auth_in_source) and
+            not libvirt_version.version_compare(3, 9, 0)):
+        test.cancel("Cannot put <encryption> or <auth> inside disk <source> "
+                    "in this libvirt version.")
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
     # Start VM and get all partions in VM.
     if vm.is_dead():
         vm.start()
@@ -194,8 +256,11 @@ def run(test, params, env):
                              "hosts":  [{"name": gluster_host_ip,
                                          "port": "24007"}]}
         elif backend_storage_type == "ceph":
+<<<<<<< HEAD
             if not utils_package.package_install(["ceph-common"]):
                 test.error("Failed to install ceph-common")
+=======
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
             ceph_host_ip = params.get("ceph_host_ip", "EXAMPLE_HOSTS")
             ceph_mon_ip = params.get("ceph_mon_ip", "EXAMPLE_MON_HOST")
             ceph_host_port = params.get("ceph_host_port", "EXAMPLE_PORTS")
@@ -205,8 +270,15 @@ def run(test, params, env):
             ceph_auth_user = params.get("ceph_auth_user")
             ceph_auth_key = params.get("ceph_auth_key")
             enable_auth = "yes" == params.get("enable_auth")
+<<<<<<< HEAD
             key_file = os.path.join(test.tmpdir, "ceph.key")
             key_opt = ""
+=======
+            key_file = os.path.join(data_dir.get_tmp_dir(), "ceph.key")
+            key_opt = ""
+            if not utils_package.package_install(["ceph-common"]):
+                test.error("Failed to install ceph-common")
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
             if enable_auth:
                 # If enable auth, prepare a local file to save key
                 if ceph_client_name and ceph_client_key:
@@ -242,7 +314,11 @@ def run(test, params, env):
             nfs_server_dir = params.get("nfs_server_dir", "nfs_server")
             emulated_image = params.get("emulated_image")
             image_name = params.get("nfs_image_name", "nfs.img")
+<<<<<<< HEAD
             tmp_dir = test.tmpdir
+=======
+            tmp_dir = data_dir.get_tmp_dir()
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
             pvt = libvirt.PoolVolumeTest(test, params)
             pvt.pre_pool(pool_name, pool_type, pool_target, emulated_image)
             nfs_mount_dir = os.path.join(tmp_dir, pool_target)
@@ -262,6 +338,7 @@ def run(test, params, env):
         vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
         disk_xml = Disk(type_name=device_type)
         disk_xml.device = device
+<<<<<<< HEAD
         disk_xml.source = disk_xml.new_disk_source(**disk_src_dict)
         disk_xml.target = {"dev": device_target, "bus": device_bus}
         driver_dict = {"name": "qemu", "type": device_format}
@@ -273,6 +350,27 @@ def run(test, params, env):
                 **{"encryption": "luks", "secret": {
                     "type": "passphrase",
                     "uuid": luks_sec_uuid}})
+=======
+        disk_xml.target = {"dev": device_target, "bus": device_bus}
+        driver_dict = {"name": "qemu", "type": device_format}
+        disk_xml.driver = driver_dict
+        disk_source = disk_xml.new_disk_source(**disk_src_dict)
+        if disk_auth_dict:
+            logging.debug("disk auth dict is: %s" % disk_auth_dict)
+            if auth_in_source:
+                disk_source.auth = disk_xml.new_auth(**disk_auth_dict)
+            else:
+                disk_xml.auth = disk_xml.new_auth(**disk_auth_dict)
+        disk_encryption_dict = {"encryption": "luks",
+                                "secret": {"type": "passphrase",
+                                           "uuid": luks_sec_uuid}}
+        disk_encryption = disk_xml.new_encryption(**disk_encryption_dict)
+        if encryption_in_source:
+            disk_source.encryption = disk_encryption
+        else:
+            disk_xml.encryption = disk_encryption
+        disk_xml.source = disk_source
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
         logging.debug("new disk xml is: %s", disk_xml)
         # Sync VM xml
         if not hotplug_disk:
@@ -280,6 +378,10 @@ def run(test, params, env):
         vmxml.sync()
         try:
             vm.start()
+<<<<<<< HEAD
+=======
+            vm.wait_for_login()
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
         except virt_vm.VMStartError as details:
             # When use wrong password in disk xml for cold plug cases,
             # VM cannot be started
@@ -311,7 +413,12 @@ def run(test, params, env):
         elif backend_storage_type == "ceph":
             cmd = ("rbd -m {0} {1} info {2} && rbd -m {0} {1} rm "
                    "{2}".format(ceph_mon_ip, key_opt, ceph_disk_name))
+<<<<<<< HEAD
             process.run(cmd, shell=True)
+=======
+            cmd_result = process.run(cmd, ignore_status=True, shell=True)
+            logging.debug("result of rbd removal: %s", cmd_result)
+>>>>>>> 1285cb6f8db7fd46851fd969677b9da81e8a496f
             if os.path.exists(key_file):
                 os.remove(key_file)
 
